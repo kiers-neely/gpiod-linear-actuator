@@ -1,9 +1,15 @@
 import threading
 import time
+from typing import Optional
 
 from loguru import logger
 from periphery import PWM, PWMError
 from pydantic import BaseModel, NonNegativeInt, PositiveInt
+
+
+class PWMRampConfig(BaseModel):
+    target_freq_hz: float
+    ramp_duration_s: float
 
 
 class PWMConfig(BaseModel):
@@ -15,6 +21,7 @@ class PWMConfig(BaseModel):
     channel: NonNegativeInt = 0
     frequency_hz: float = 1000.0
     duty_cycle: float = 0.0
+    ramp_config: Optional[PWMRampConfig] = None
 
 
 class HardwarePWM:
@@ -96,19 +103,24 @@ class HardwarePWM:
     def _is_enabled(self) -> bool:
         return self._pwm.enabled
 
+
 class VariableSpeedPWM:
     """Drives a HardwarePWM through a linear frequency ramp on a background thread."""
 
-    def __init__(self, pwm_device: HardwarePWM):
+    def __init__(self, pwm_device: HardwarePWM, ramp_config: PWMRampConfig):
         self.pwm = pwm_device
+        self.config = ramp_config
+        self.target_freq = ramp_config.target_freq_hz
+        self.ramp_duration = ramp_config.ramp_duration_s
+
         self.current_freq: float = pwm_device.config.frequency_hz
         self._sweep_thread: threading.Thread | None = None
         self._cancel_event = threading.Event()
 
-    def ramp_to(self, target_freq: float, duration_s: float):
-        if target_freq <= 0:
+    def ramp_to(self):
+        if self.target_freq <= 0:
             raise ValueError("target_freq must be greater than 0")
-        if duration_s < 0:
+        if self.ramp_duration < 0:
             raise ValueError("duration_s must be non-negative")
 
         # stop any active sweep thread first
@@ -120,21 +132,23 @@ class VariableSpeedPWM:
         # start up a background thread for stepping loop
         self._sweep_thread = threading.Thread(
             target=self._run_ramp,
-            args=(target_freq, duration_s),
             daemon=True,
         )
         self._sweep_thread.start()
 
-    def _run_ramp(self, target: float, duration: float):
+    def _run_ramp(self):
         initial_hz = self.current_freq
-        delta_hz = target - initial_hz
+        target_hz = self.target_freq
+        duration = self.ramp_duration
+
+        delta_hz = target_hz - initial_hz
 
         # total number of granular steps to make during ramp duration
         # (50-100 updates per sec)
         steps = int(duration * 100)
         if steps == 0:
-            self.pwm.set_frequency(target)
-            self.current_freq = target
+            self.pwm.set_frequency(target_hz)
+            self.current_freq = target_hz
             return
 
         time_per_step = duration / steps

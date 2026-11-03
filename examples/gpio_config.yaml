@@ -1,0 +1,32 @@
+# Example GPIOConfig: declarative pin mapping + PWM + ramp settings for one motor.
+# Load with: gpiod_stepper_motors.config.load_gpio_config("examples/gpio_config.yaml")
+name: x-axis
+chip_path: /dev/gpiochip0
+
+pin_mapping:
+  - label: PUL
+    offset: 17
+  - label: DIR
+    offset: 27
+  - label: ENA
+    offset: 22
+  - label: ALM
+    offset: 23
+    pull: UP
+    normally_closed: false
+  - label: LIM
+    offset: 24
+    pull: UP
+    normally_closed: true
+
+pwm:
+  label: step
+  offset: 17
+  chip: 0
+  channel: 0
+  frequency_hz: 200.0
+  duty_cycle: 0.5
+
+velocity_profile:
+  target_freq_hz: 2000.0
+  ramp_duration_s: 1.5

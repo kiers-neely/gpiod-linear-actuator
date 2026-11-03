@@ -12,17 +12,20 @@ import argparse
 import time
 from unittest.mock import patch
 
-from gpiod_stepper_motors.stepper import HardwarePWM, PWMConfig, VariableSpeedPWM
+from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, PWMRampConfig, VariableSpeedPWM
 
 
-def record_ramp(start_hz: float, segments: list[tuple[float, float]]) -> list[tuple[float, float]]:
+def record_ramp(
+    start_hz: float, segments: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
     """Run a sequence of (target_hz, duration_s) ramps back-to-back and record (time, hz) samples."""
     samples: list[tuple[float, float]] = []
 
-    with patch("gpiod_stepper_motors.stepper.PWM"):
+    with patch("gpiod_stepper_motors.pwm.PWM"):
         config = PWMConfig(label="plot", offset=1, frequency_hz=start_hz)
         pwm = HardwarePWM(config)
-        ramp = VariableSpeedPWM(pwm)
+        ramp_config = PWMRampConfig(target_freq_hz=start_hz, ramp_duration_s=0.0)
+        ramp = VariableSpeedPWM(pwm, ramp_config=ramp_config)
 
         start_time = time.monotonic()
         original_set_frequency = pwm.set_frequency
@@ -37,23 +40,69 @@ def record_ramp(start_hz: float, segments: list[tuple[float, float]]) -> list[tu
         for target_hz, duration_s in segments:
             if duration_s <= 0:
                 continue
-            ramp.ramp_to(target_hz, duration_s)
+            ramp.target_freq = target_hz
+            ramp.ramp_duration = duration_s
+            ramp.ramp_to()
             ramp._sweep_thread.join(timeout=duration_s + 5)
 
     return samples
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--start", type=float, default=100.0, help="Starting frequency in Hz")
-    parser.add_argument("--target", type=float, default=None, help="Target frequency for a single ramp (Hz)")
-    parser.add_argument("--duration", type=float, default=1.0, help="Duration of a single ramp, in seconds")
-    parser.add_argument("--peak", type=float, default=None, help="Peak frequency for an accel/decel profile (Hz)")
-    parser.add_argument("--end", type=float, default=None, help="Final frequency after decel (Hz, defaults to --start)")
-    parser.add_argument("--accel-duration", type=float, default=1.0, help="Time to ramp from --start to --peak")
-    parser.add_argument("--cruise-duration", type=float, default=0.0, help="Time to hold at --peak before decelerating")
-    parser.add_argument("--decel-duration", type=float, default=1.0, help="Time to ramp from --peak to --end")
-    parser.add_argument("--output", type=str, default=None, help="Save plot to this path instead of showing it")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--start", type=float, default=100.0, help="Starting frequency in Hz"
+    )
+    parser.add_argument(
+        "--target",
+        type=float,
+        default=None,
+        help="Target frequency for a single ramp (Hz)",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=1.0,
+        help="Duration of a single ramp, in seconds",
+    )
+    parser.add_argument(
+        "--peak",
+        type=float,
+        default=None,
+        help="Peak frequency for an accel/decel profile (Hz)",
+    )
+    parser.add_argument(
+        "--end",
+        type=float,
+        default=None,
+        help="Final frequency after decel (Hz, defaults to --start)",
+    )
+    parser.add_argument(
+        "--accel-duration",
+        type=float,
+        default=1.0,
+        help="Time to ramp from --start to --peak",
+    )
+    parser.add_argument(
+        "--cruise-duration",
+        type=float,
+        default=0.0,
+        help="Time to hold at --peak before decelerating",
+    )
+    parser.add_argument(
+        "--decel-duration",
+        type=float,
+        default=1.0,
+        help="Time to ramp from --peak to --end",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Save plot to this path instead of showing it",
+    )
     args = parser.parse_args()
 
     if args.peak is not None:

@@ -1,0 +1,12 @@
+# Example PWMConfig for a single hardware-PWM channel, with an optional ramp.
+# Load with: gpiod_stepper_motors.config.load_pwm_config("examples/pwm_config.yaml")
+label: step
+offset: 18
+chip: 0
+channel: 0
+frequency_hz: 200.0
+duty_cycle: 0.5
+
+ramp_config:
+  target_freq_hz: 2000.0
+  ramp_duration_s: 1.5

@@ -27,7 +27,9 @@ uv sync
 from gpiod_stepper_motors import HardwarePWM, VariableSpeedPWM
 from gpiod_stepper_motors.pwm import PWMConfig
 
-pwm = HardwarePWM(PWMConfig(label="step", offset=18, chip=0, channel=0, frequency_hz=200.0))
+pwm = HardwarePWM(
+    PWMConfig(label="step", offset=18, chip=0, channel=0, frequency_hz=200.0)
+)
 ramp = VariableSpeedPWM(pwm)
 
 pwm.start_pwm()

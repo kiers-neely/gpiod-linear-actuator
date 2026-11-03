@@ -5,7 +5,12 @@ import gpiod
 from gpiod.line import Direction as LineDirection
 from gpiod.line import Value
 
-from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, VariableSpeedPWM
+from gpiod_stepper_motors.pwm import (
+    HardwarePWM,
+    PWMConfig,
+    PWMRampConfig,
+    VariableSpeedPWM,
+)
 
 
 class StepperMotorTests(unittest.TestCase):
@@ -173,24 +178,30 @@ class VariableSpeedPWMTests(unittest.TestCase):
         self.sleep = self.sleep_patcher.start()
         self.addCleanup(self.sleep_patcher.stop)
 
-    def make_variable_speed_pwm(self, frequency_hz=100.0):
+    def make_variable_speed_pwm(self, frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0):
         config = PWMConfig(label="test", offset=12, frequency_hz=frequency_hz)
-        return VariableSpeedPWM(HardwarePWM(config))
+        ramp_config = PWMRampConfig(target_freq_hz=target_freq_hz, ramp_duration_s=ramp_duration_s)
+        return VariableSpeedPWM(HardwarePWM(config), ramp_config=ramp_config)
 
     def test_ramp_to_rejects_non_positive_target_frequency(self):
         vsp = self.make_variable_speed_pwm()
 
+        vsp.target_freq = 0
         with self.assertRaises(ValueError):
-            vsp.ramp_to(0, 1.0)
+            vsp.ramp_to()
+
+        vsp.target_freq = -10
         with self.assertRaises(ValueError):
-            vsp.ramp_to(-10, 1.0)
+            vsp.ramp_to()
+
         self.assertIsNone(vsp._sweep_thread)
 
     def test_ramp_to_rejects_negative_duration(self):
         vsp = self.make_variable_speed_pwm()
+        vsp.ramp_duration = -1.0
 
         with self.assertRaises(ValueError):
-            vsp.ramp_to(500.0, -1.0)
+            vsp.ramp_to()
         self.assertIsNone(vsp._sweep_thread)
 
     def test_ramp_to_raises_if_previous_ramp_still_running(self):
@@ -200,12 +211,12 @@ class VariableSpeedPWMTests(unittest.TestCase):
         vsp._sweep_thread = stuck_thread
 
         with self.assertRaises(RuntimeError):
-            vsp.ramp_to(500.0, 1.0)
+            vsp.ramp_to()
 
     def test_ramp_to_runs_in_background_thread_and_reaches_target(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0)
+        vsp = self.make_variable_speed_pwm(frequency_hz=100.0, target_freq_hz=300.0, ramp_duration_s=0.05)
 
-        vsp.ramp_to(300.0, 0.05)
+        vsp.ramp_to()
         vsp._sweep_thread.join(timeout=1)
 
         self.assertFalse(vsp._sweep_thread.is_alive())
@@ -213,11 +224,15 @@ class VariableSpeedPWMTests(unittest.TestCase):
         self.assertEqual(self.pwm_cls.return_value.frequency, 300.0)
 
     def test_run_ramp_interpolates_frequency_linearly(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0)
         steps = 3
+        vsp = self.make_variable_speed_pwm(
+            frequency_hz=100.0, target_freq_hz=400.0, ramp_duration_s=steps / 100
+        )
 
-        with patch.object(vsp.pwm, "set_frequency", wraps=vsp.pwm.set_frequency) as set_freq:
-            vsp._run_ramp(target=400.0, duration=steps / 100)
+        with patch.object(
+            vsp.pwm, "set_frequency", wraps=vsp.pwm.set_frequency
+        ) as set_freq:
+            vsp._run_ramp()
 
         expected = [
             unittest.mock.call(100.0 + 300.0 * (i / steps)) for i in range(1, steps + 1)
@@ -226,28 +241,30 @@ class VariableSpeedPWMTests(unittest.TestCase):
         self.assertEqual(vsp.current_freq, 400.0)
 
     def test_run_ramp_sets_frequency_directly_when_duration_rounds_to_zero_steps(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0)
+        vsp = self.make_variable_speed_pwm(
+            frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=0.001
+        )
 
-        vsp._run_ramp(target=500.0, duration=0.001)
+        vsp._run_ramp()
 
         self.assertEqual(self.pwm_cls.return_value.frequency, 500.0)
         self.assertEqual(vsp.current_freq, 500.0)
 
     def test_run_ramp_stops_immediately_when_cancelled(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0)
+        vsp = self.make_variable_speed_pwm(frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0)
         vsp._cancel_event.set()
 
         with patch.object(vsp.pwm, "set_frequency") as set_freq:
-            vsp._run_ramp(target=500.0, duration=1.0)
+            vsp._run_ramp()
 
         set_freq.assert_not_called()
 
     def test_run_ramp_stops_when_pwm_reports_fault(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0)
+        vsp = self.make_variable_speed_pwm(frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0)
         vsp.pwm._fault.set()
 
         with patch.object(vsp.pwm, "set_frequency") as set_freq:
-            vsp._run_ramp(target=500.0, duration=1.0)
+            vsp._run_ramp()
 
         set_freq.assert_not_called()
         self.assertTrue(vsp._cancel_event.is_set())
