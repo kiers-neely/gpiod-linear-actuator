@@ -55,6 +55,8 @@ _GPIO_VALUE = {
 
 
 class OutputLine(BaseModel):
+    """Configuration model for a single GPIO output pin."""
+
     label: GPIOLabel
     direction: LineDirection = LineDirection.OUTPUT
     offset: PositiveInt
@@ -63,6 +65,8 @@ class OutputLine(BaseModel):
 
 
 class InputLine(BaseModel):
+    """Configuration model for a single GPIO output pin"""
+
     label: GPIOLabel
     direction: LineDirection = LineDirection.INPUT
     offset: PositiveInt
@@ -89,6 +93,8 @@ class InputLine(BaseModel):
 
 
 class PWMConfig(BaseModel):
+    """Configuration for a single hardware-PWM compatible GPIO pin on a Raspberry Pi."""
+
     label: str
     offset: PositiveInt
     chip: NonNegativeInt = 0
@@ -238,7 +244,7 @@ class VariableSpeedPWM:
                 self.pwm.set_frequency(next_hz)
                 self.current_freq = next_hz
             except Exception as e:
-                logger.error(f"[PWM] Failed to set step frequency: {e}")
+                logger.error(f"Failed to set step frequency: {e}")
 
             time.sleep(time_per_step)
 
