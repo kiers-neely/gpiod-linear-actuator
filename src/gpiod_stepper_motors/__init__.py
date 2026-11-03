@@ -1,3 +1,3 @@
-from .stepper import Direction, StepperMotor
+from .stepper import MotorDirection, StepperMotor
 
-__all__ = ["Direction", "StepperMotor"]
+__all__ = ["MotorDirection", "StepperMotor"]
