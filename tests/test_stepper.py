@@ -1,70 +1,77 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import gpiod
+from gpiod.line import Direction as LineDirection
 from gpiod.line import Value
 
-from gpiod_stepper_motors import MotorDirection, StepperMotor
-from gpiod_stepper_motors.stepper import HardwarePWM, PWMConfig, VariableSpeedPWM
+from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, VariableSpeedPWM
 
 
 class StepperMotorTests(unittest.TestCase):
+    """Mocks a GPIO chip/channel at the gpiod layer for future GPIOStepper tests.
+
+    No stepper motor class exists yet (StepperMotor was removed, GPIOStepper is
+    still a stub), so these only exercise the request_lines double itself.
+    """
+
+    STEP_PIN = 17
+    DIR_PIN = 27
+
     def setUp(self):
-        self.request_patcher = patch("gpiod_stepper_motors.stepper.gpiod.request_lines")
+        self.request_patcher = patch("gpiod.request_lines")
         self.request_lines = self.request_patcher.start()
         self.addCleanup(self.request_patcher.stop)
         self.request = self.request_lines.return_value
-        self.sleep_patcher = patch("gpiod_stepper_motors.stepper.time.sleep")
-        self.sleep = self.sleep_patcher.start()
-        self.addCleanup(self.sleep_patcher.stop)
 
-    def make_motor(self, **kwargs):
-        return StepperMotor("/dev/gpiochip0", 17, 27, **kwargs)
+    def make_request(self, chip="/dev/gpiochip0", consumer="gpiod-stepper-motors"):
+        config = {
+            self.STEP_PIN: gpiod.LineSettings(
+                direction=LineDirection.OUTPUT,
+                output_value=Value.INACTIVE,
+            ),
+            self.DIR_PIN: gpiod.LineSettings(
+                direction=LineDirection.OUTPUT,
+                output_value=Value.INACTIVE,
+            ),
+        }
+        return gpiod.request_lines(chip, consumer=consumer, config=config)
 
     def test_requests_step_and_direction_outputs_in_inactive_state(self):
-        self.make_motor()
+        self.make_request()
 
         self.request_lines.assert_called_once()
         config = self.request_lines.call_args.kwargs["config"]
-        self.assertEqual(config[17].output_value, Value.INACTIVE)
-        self.assertEqual(config[27].output_value, Value.INACTIVE)
+        self.assertEqual(config[self.STEP_PIN].output_value, Value.INACTIVE)
+        self.assertEqual(config[self.DIR_PIN].output_value, Value.INACTIVE)
 
-    def test_step_emits_pulses_in_requested_direction(self):
-        motor = self.make_motor(step_interval=0.001, pulse_width=0.00001)
+    def test_mock_request_records_set_value_calls(self):
+        request = self.make_request()
 
-        motor.step(2, MotorDirection.FORWARD)
+        request.set_value(self.DIR_PIN, Value.ACTIVE)
+        request.set_value(self.STEP_PIN, Value.ACTIVE)
+        request.set_value(self.STEP_PIN, Value.INACTIVE)
 
         self.assertEqual(
             self.request.set_value.call_args_list,
             [
-                unittest.mock.call(27, Value.ACTIVE),
-                unittest.mock.call(17, Value.ACTIVE),
-                unittest.mock.call(17, Value.INACTIVE),
-                unittest.mock.call(17, Value.ACTIVE),
-                unittest.mock.call(17, Value.INACTIVE),
-                unittest.mock.call(17, Value.INACTIVE),
+                unittest.mock.call(self.DIR_PIN, Value.ACTIVE),
+                unittest.mock.call(self.STEP_PIN, Value.ACTIVE),
+                unittest.mock.call(self.STEP_PIN, Value.INACTIVE),
             ],
         )
-        self.assertEqual(self.sleep.call_count, 4)
 
-    def test_context_manager_releases_gpio_lines(self):
-        with self.make_motor() as motor:
-            motor.step(1, MotorDirection.REVERSE)
+    def test_mock_request_release_is_recorded(self):
+        request = self.make_request()
+
+        request.release()
 
         self.request.release.assert_called_once()
-        with self.assertRaises(RuntimeError):
-            motor.step(1, MotorDirection.FORWARD)
-
-    def test_rejects_invalid_pin_and_timing(self):
-        with self.assertRaises(ValueError):
-            StepperMotor("/dev/gpiochip0", 17, 17)
-        with self.assertRaises(ValueError):
-            self.make_motor(step_interval=0.00001, pulse_width=0.001)
-        self.request_lines.assert_not_called()
 
 
 class HardwarePWMTests(unittest.TestCase):
     def setUp(self):
-        self.pwm_patcher = patch("gpiod_stepper_motors.stepper.PWM")
+        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
         self.pwm_cls = self.pwm_patcher.start()
         self.addCleanup(self.pwm_patcher.stop)
         self.pwm = self.pwm_cls.return_value
@@ -159,10 +166,10 @@ class HardwarePWMTests(unittest.TestCase):
 
 class VariableSpeedPWMTests(unittest.TestCase):
     def setUp(self):
-        self.pwm_patcher = patch("gpiod_stepper_motors.stepper.PWM")
+        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
         self.pwm_cls = self.pwm_patcher.start()
         self.addCleanup(self.pwm_patcher.stop)
-        self.sleep_patcher = patch("gpiod_stepper_motors.stepper.time.sleep")
+        self.sleep_patcher = patch("gpiod_stepper_motors.pwm.time.sleep")
         self.sleep = self.sleep_patcher.start()
         self.addCleanup(self.sleep_patcher.stop)
 
