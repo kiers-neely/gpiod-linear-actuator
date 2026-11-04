@@ -1,6 +1,5 @@
 import threading
 import time
-from typing import Optional
 
 from loguru import logger
 from periphery import PWM, PWMError
@@ -8,12 +7,42 @@ from pydantic import BaseModel, NonNegativeInt, PositiveInt
 
 
 class PWMRampConfig(BaseModel):
+    """Linear acceleration/deceleration profile for a `VariableSpeedPWM` ramp.
+
+    Describes a single ramp segment: move from whatever frequency the PWM
+    channel is currently at to `target_freq_hz`, over `ramp_duration_s`
+    seconds, via linear interpolation.
+
+    Attributes:
+        target_freq_hz: The frequency, in Hz, to ramp to. Must be greater
+            than 0.
+        ramp_duration_s: How long the ramp should take, in seconds. Must be
+            non-negative; 0 jumps directly to `target_freq_hz`.
+    """
+
     target_freq_hz: float
     ramp_duration_s: float
 
 
 class PWMConfig(BaseModel):
-    """Configuration for a single hardware-PWM compatible GPIO pin on a Raspberry Pi."""
+    """Configuration for a single hardware-PWM compatible GPIO pin.
+
+    Describes one PWM channel on a Raspberry Pi (via `python-periphery`)
+    and its starting frequency/duty cycle. Optionally embeds a
+    `PWMRampConfig` describing the ramp a `VariableSpeedPWM` built on top
+    of this channel should run.
+
+    Attributes:
+        label: A human-readable identifier for this PWM channel, used in
+            logs.
+        offset: The GPIO line offset this PWM channel is wired to.
+        chip: The `python-periphery` PWM chip number.
+        channel: The PWM channel number on `chip`.
+        frequency_hz: The initial PWM frequency, in Hz.
+        duty_cycle: The initial duty cycle, between 0.0 and 1.0.
+        ramp_config: Optional ramp settings for use with `VariableSpeedPWM`.
+            `None` means no ramp is configured for this channel.
+    """
 
     label: str
     offset: PositiveInt
@@ -21,11 +50,25 @@ class PWMConfig(BaseModel):
     channel: NonNegativeInt = 0
     frequency_hz: float = 1000.0
     duty_cycle: float = 0.0
-    ramp_config: Optional[PWMRampConfig] = None
+    ramp_config: PWMRampConfig | None = None
 
 
 class HardwarePWM:
-    """Wrapper for handling a single hardware-timed PWM line using python-periphery."""
+    """Wraps a single hardware-timed PWM line via `python-periphery`.
+
+    Owns the underlying `periphery.PWM` device for one chip/channel pair,
+    and tracks a fault flag that latches whenever a frequency/duty-cycle
+    write or an enable/disable call fails. Once faulted, `start_pwm`
+    refuses to re-enable output until `_clear_fault` is called.
+
+    Args:
+        config: The PWM channel's chip/channel, starting frequency, and
+            starting duty cycle. The device is initialized with these
+            values immediately on construction.
+
+    Attributes:
+        config: The `PWMConfig` this instance was constructed with.
+    """
 
     def __init__(self, config: PWMConfig):
         self.config = config
@@ -45,7 +88,7 @@ class HardwarePWM:
             self._pwm.close()
         except Exception as e:
             logger.error(
-                f"Exception caught in closing PWM on channel {self._pwm.channel}"
+                f"Exception caught in closing PWM on channel {self._pwm.channel}: {e}"
             )
 
     def set_frequency(self, hz: float):
@@ -91,9 +134,7 @@ class HardwarePWM:
 
     def _clear_fault(self) -> bool:
         self._fault.clear()
-        if self._fault.is_set():
-            return False
-        return True
+        return not self._fault.is_set()
 
     @property
     def _is_faulted(self) -> bool:
@@ -105,7 +146,28 @@ class HardwarePWM:
 
 
 class VariableSpeedPWM:
-    """Drives a HardwarePWM through a linear frequency ramp on a background thread."""
+    """Drives a `HardwarePWM` through a linear frequency ramp.
+
+    Runs the ramp on a background daemon thread, updating the underlying
+    `HardwarePWM`'s frequency roughly every 10ms (see `_run_ramp`) until
+    `ramp_duration` elapses or the ramp is cancelled. The ramp aborts early
+    if the underlying `HardwarePWM` reports a fault.
+
+    Args:
+        pwm_device: The `HardwarePWM` instance to drive.
+        ramp_config: The target frequency and duration for `ramp_to()`.
+            Copied onto `target_freq`/`ramp_duration`, which can be
+            reassigned directly before calling `ramp_to()` again.
+
+    Attributes:
+        pwm: The `HardwarePWM` being driven.
+        current_freq: The last frequency successfully applied to `pwm`,
+            seeded from `pwm_device.config.frequency_hz` at construction.
+        target_freq: The frequency the next `ramp_to()` call will ramp
+            towards.
+        ramp_duration: How long, in seconds, the next `ramp_to()` call
+            should take.
+    """
 
     def __init__(self, pwm_device: HardwarePWM, ramp_config: PWMRampConfig):
         self.pwm = pwm_device

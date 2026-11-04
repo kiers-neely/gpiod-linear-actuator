@@ -10,12 +10,16 @@ pin_mapping:
     offset: 27
   - label: ENA
     offset: 22
-  - label: ALM
+  - label: ALARM
     offset: 23
     pull: UP
     normally_closed: false
-  - label: LIM
+  - label: MAX_LIMIT
     offset: 24
+    pull: UP
+    normally_closed: true
+  - label: MIN_LIMIT
+    offset: 22
     pull: UP
     normally_closed: true
 

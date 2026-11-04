@@ -1,9 +1,23 @@
+from collections.abc import Callable
+from enum import StrEnum
+from typing import Any, Protocol, runtime_checkable
 
-import asyncio
-from typing import Callable, Iterable, Protocol, Optional, runtime_checkable
 
-import gpiod
-from pydantic import PositiveInt
+class InputLabel(StrEnum):
+    ALARM = "ALARM"
+    MAX_LIMIT = "MAX_LIMIT"
+    MIN_LIMIT = "MIN_LIMIT"
+
+
+class OutputLabel(StrEnum):
+    PUL = "PUL"
+    DIR = "DIR"
+    ENA = "ENA"
+
+
+class GPIOValue(StrEnum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
 
 
 @runtime_checkable
@@ -14,20 +28,21 @@ class GPIOBackend(Protocol):
     """
 
     def open(self) -> None:
-        """Open the chip and claim every configured line."""
+        """Open all the necessary resources for this device."""
 
     def close(self) -> None:
-        """Release the lines and close the chip. Safe to call twice."""
+        """Release/close all resources. Safe to call twice."""
 
-    def is_active(self, label: str) -> bool:
+    def is_active(self, line: InputLabel | OutputLabel | int) -> bool:
         """Whether the line is currently asserted."""
         ...
 
-    def set(self, label: str, on: bool) -> None:
-        """Assert or release one line."""
+    def set(self, line: InputLabel | OutputLabel | int, value: GPIOValue) -> None:
+        """Assert or release one or more GPIO lines."""
+        ...
 
-    def set_many(self, labels: Iterable[str], on: bool) -> None:
-        """Assert or release several lines in one write."""
+    def get(self, line: InputLabel | OutputLabel | int) -> Any:
+        """Poll the current logical state of one or more GPIO lines."""
 
-    def on_assert(self, label: str, callback: Callable[[], None]) -> None:
+    def on_assert(self, line: InputLabel | int, callback: Callable[[], None]) -> None:
         """Call `callback` each time the line asserts."""

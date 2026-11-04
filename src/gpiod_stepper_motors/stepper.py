@@ -1,22 +1,18 @@
-import math
-import threading
-import time
-from enum import Enum, StrEnum
-from typing import Any, Literal
-from gpiod_stepper_motors.protocol import GPIOBackend
-from gpiod_stepper_motors.pwm import PWMConfig, PWMRampConfig
-from pydantic import BaseModel, NonNegativeInt, PositiveInt
-from periphery import PWM, PWMError
-from loguru import logger
+from enum import StrEnum
 
-import gpiod
-from gpiod.line_settings import LineSettings
-from gpiod.line import Direction as LineDirection
-from gpiod.line import Value as LineValue
-from gpiod.line import Edge as LineEdge
+from gpiod.chip import Chip
 from gpiod.line import Bias as LineBias
-from pydantic.functional_validators import model_validator
-from typing_extensions import Optional
+from gpiod.line import Direction as LineDirection
+from gpiod.line import Edge as LineEdge
+from gpiod.line import Value as LineValue
+from gpiod.line_request import LineRequest
+from gpiod.line_settings import LineSettings
+from loguru import logger
+from pydantic import BaseModel, PositiveInt
+
+from gpiod_stepper_motors.pwm import PWMConfig, PWMRampConfig
+
+from .protocol import GPIOBackend, GPIOValue, InputLabel, OutputLabel
 
 
 class Pull(StrEnum):
@@ -28,19 +24,6 @@ class Pull(StrEnum):
     DISABLED = "DISABLED"
 
 
-class GPIOLabel(StrEnum):
-    """A str enumeration of GPIO pin labels.
-
-    Includes PUL/DIR/ENA for standard stepper motor wiring, plus ALM/LIM for
-    optional use with stepper driver ALARM output and LIM for limit switches."""
-
-    PUL = "PUL"
-    DIR = "DIR"
-    ENA = "ENA"
-    ALM = "ALM"
-    LIM = "LIM"
-
-
 _GPIO_BIAS_FROM_PULL = {
     Pull.UP: LineBias.PULL_UP,
     Pull.DOWN: LineBias.PULL_DOWN,
@@ -48,11 +31,16 @@ _GPIO_BIAS_FROM_PULL = {
     Pull.DISABLED: LineBias.DISABLED,
 }
 
+_GPIO_VALUE = {
+    GPIOValue.ACTIVE: LineValue.ACTIVE,
+    GPIOValue.INACTIVE: LineValue.INACTIVE,
+}
+
 
 class OutputLine(BaseModel):
     """Configuration model for a single GPIO output pin."""
 
-    label: GPIOLabel
+    label: OutputLabel
     offset: PositiveInt
     active_low: bool = False
     initial_value: bool = False
@@ -61,7 +49,7 @@ class OutputLine(BaseModel):
 class InputLine(BaseModel):
     """Configuration model for a single GPIO output pin."""
 
-    label: GPIOLabel
+    label: InputLabel
     offset: PositiveInt
     pull: Pull
     normally_closed: bool = False
@@ -100,35 +88,190 @@ class InputLine(BaseModel):
 
 
 class GPIOConfig(BaseModel):
+    """Full declarative configuration for one stepper motor axis.
+
+    Combines a GPIO pin mapping (STEP/DIR/ENA outputs, ALARM/limit-switch
+    inputs) with the PWM channel that drives STEP and an optional velocity
+    ramp profile. Consumed by `GPIOStepper`; `chip_path` and `pin_mapping`
+    are also what `GPIODevice` is built from when no backend is injected.
+    Can be loaded from YAML via `gpiod_stepper_motors.load_gpio_config`.
+
+    Attributes:
+        name: A human-readable identifier for this axis/motor, used in logs.
+        chip_path: Path to the GPIO character device, e.g. "/dev/gpiochip0".
+        pin_mapping: The device's configured lines, a mix of `OutputLine`
+            (STEP/DIR/ENA-style outputs) and `InputLine` (ALARM/limit-switch
+            inputs) entries.
+        pwm: Hardware PWM channel configuration driving the STEP signal.
+        velocity_profile: Optional acceleration/deceleration ramp settings.
+            `None` means the motor runs at a fixed `pwm.frequency_hz` with
+            no ramping.
+
+    Example:
+        >>> load_gpio_config("examples/gpio_config.yaml")
+        GPIOConfig(name='x-axis', chip_path='/dev/gpiochip0', ...)
+    """
+
     name: str
     chip_path: str = "/dev/gpiochip0"
     pin_mapping: list[InputLine | OutputLine]
     pwm: PWMConfig
-    velocity_profile: Optional[PWMRampConfig] = None
+    velocity_profile: PWMRampConfig | None = None
 
 
-class GPIOStepper:
+class GPIODevice(GPIOBackend):
+    """Concrete `GPIOBackend` that claims real GPIO lines via `gpiod`.
 
-    def __init__(self, config: GPIOConfig, gpio: GPIOBackend) -> None:
-        self.config = config
-        self._chip_path = config.chip_path
+    Builds a single `gpiod` line-settings mapping from a declarative pin
+    mapping (a mix of `OutputLine`s and `InputLine`s) and claims every
+    configured line as one combined line request. The `gpiod.Chip` handle
+    itself is only opened for the duration of that request (see
+    `claim_lines`); the resulting `LineRequest` is independent of the chip
+    and is what backs every subsequent `get`/`set`/`is_active` call.
 
-        self._output_mappings = {
+    Args:
+        chip_path: Path to the GPIO character device, e.g. "/dev/gpiochip0".
+        pin_mapping: The device's configured lines, a mix of `OutputLine`
+            (STEP/DIR/ENA-style outputs) and `InputLine` (ALARM/limit-switch
+            inputs) entries.
+
+    Attributes:
+        line_request: The claimed `gpiod.LineRequest`, or `None` before
+            `open()` has been called or after `close()`.
+
+    Example:
+        >>> device = GPIODevice(chip_path="/dev/gpiochip0", pin_mapping=pin_mapping)
+        >>> device.open()
+        >>> device.set(OutputLabel.PUL, GPIOValue.ACTIVE)
+        >>> device.is_active(InputLabel.ALARM)
+        False
+        >>> device.close()
+    """
+
+    def __init__(
+        self,
+        chip_path: str,
+        pin_mapping: list[InputLine | OutputLine],
+    ):
+        self._chip_path = chip_path
+        self._offset_by_label = {line.label: line.offset for line in pin_mapping}
+
+        self._line_mappings = {
             line.offset: LineSettings(
                 direction=LineDirection.OUTPUT,
                 active_low=line.active_low,
                 output_value=line.initial_value,
             )
-            for line in config.pin_mapping
+            for line in pin_mapping
             if isinstance(line, OutputLine)
         }
 
-        self._input_mappings = {
-            line.offset: LineSettings(
-                direction=LineDirection.INPUT,
-                edge_detection=line.edge_from_active_logic,
-                bias=_GPIO_BIAS_FROM_PULL[line.pull],
+        self._line_mappings.update(
+            {
+                line.offset: LineSettings(
+                    direction=LineDirection.INPUT,
+                    edge_detection=line.edge_from_active_logic,
+                    bias=_GPIO_BIAS_FROM_PULL[line.pull],
+                )
+                for line in pin_mapping
+                if isinstance(line, InputLine)
+            }
+        )
+
+        self.line_request = None
+
+    def claim_lines(self) -> LineRequest:
+        """
+        Claim all of the configured GPIO lines (inputs and outputs) for this
+        device in a single request. Open the chip to request the lines only,
+        then return the LineRequest to the caller. After the lines are
+        claimed, the Chip fd is closed.
+
+        Returns:
+            LineRequest: The combined input/output line request object.
+        """
+        with Chip(self._chip_path) as chip:
+            return chip.request_lines(
+                config=self._line_mappings, consumer="stepper-driver"
             )
-            for line in config.pin_mapping
-            if isinstance(line, InputLine)
-        }
+
+    def open(self):
+        """
+        Claim every configured GPIO line, storing the resulting LineRequest.
+
+        Raises:
+            RuntimeError: If any configured line could not be claimed. The
+                original exception is chained via `__cause__`.
+        """
+        try:
+            self.line_request = self.claim_lines()
+        except Exception as e:
+            logger.error(f"Exception caught in opening GPIO line requests: {e}")
+            self.close()
+            raise RuntimeError("Failed to claim GPIO lines") from e
+
+    def get(self, line: InputLabel | OutputLabel | int) -> LineValue:
+        """
+        Polls whether the line is currently asserted (logically active).
+        Can look up a line by its configured str label or directly by offset.
+
+        Args:
+            line (InputLabel | OutputLabel | int): The label (str) or offset (int)
+            value for an `OutputLine` or `InputLine`, assigned at configuration.
+
+        Returns:
+            bool: True if the line is actively asserted, False otherwise.
+        """
+
+        if isinstance(line, InputLabel | OutputLabel):
+            offset = self._offset_by_label.get(line)
+            if offset is None:
+                raise KeyError(f"Offset for label {line} could not be found")
+            return self.line_request.get_value(offset)
+        else:
+            return self.line_request.get_value(line)
+
+    def set(self, line: InputLabel | OutputLabel | int, value: GPIOValue) -> None:
+        """
+        Assert or release a single configured GPIO line.
+        Can look up a line by its configured str label or directly by offset.
+
+        Args:
+            line (InputLabel | OutputLabel | int): The label (str) or offset (int)
+                value for an `OutputLine` or `InputLine`, assigned at configuration.
+            value (GPIOValue): The logical value to write to the line.
+
+        Raises:
+            KeyError: If `line` is a label not found in the configured pin mapping.
+        """
+        if isinstance(line, InputLabel | OutputLabel):
+            offset = self._offset_by_label.get(line)
+            if offset is None:
+                raise KeyError(f"Offset for label {line} could not be found")
+        else:
+            offset = line
+        self.line_request.set_value(offset, _GPIO_VALUE[value])
+
+    def is_active(self, line: InputLabel | OutputLabel | int) -> bool:
+        return self.get(line) == LineValue.ACTIVE
+
+    def close(self):
+        """Release the claimed line request, if any. Safe to call twice."""
+        if self.line_request is not None:
+            logger.debug(
+                f"Releasing all lines claimed on {self.line_request.chip_name}"
+            )
+            self.line_request.release()
+            self.line_request = None
+
+
+class GPIOStepper:
+    """Asynchronous GPIO stepper control class."""
+
+    def __init__(self, config: GPIOConfig, gpio: GPIOBackend | None = None):
+        self._config = config
+        self._gpio = (
+            gpio
+            if gpio is not None
+            else GPIODevice(chip_path=config.chip_path, pin_mapping=config.pin_mapping)
+        )

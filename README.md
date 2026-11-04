@@ -20,8 +20,15 @@ uv sync
 - **`VariableSpeedPWM`** — drives a `HardwarePWM` through a linear frequency
   ramp on a background thread, for accelerating/decelerating a STEP signal
   rather than jumping straight to a target speed.
-- **`GPIOStepper`** — declarative STEP/DIR/ENA/ALM/LIM pin mapping via
-  `GPIOConfig`, `OutputLine`, and `InputLine`. Not implemented yet.
+- **`GPIODevice`** — claims a declarative pin mapping (STEP/DIR/ENA outputs,
+  ALARM/limit-switch inputs) as a single `gpiod` line request, and exposes
+  `open`/`close`/`get`/`set`/`is_active`. Edge-event callbacks (`on_assert`)
+  are planned but not implemented yet.
+- **`GPIOStepper`** — ties a `GPIOConfig` (pin mapping + PWM + ramp settings)
+  together with a `GPIODevice`. Still a thin shell; stepping logic isn't
+  implemented yet.
+- **`load_gpio_config`/`load_pwm_config`/`load_pwm_ramp_config`** — load any
+  of this library's pydantic config models from a YAML file.
 
 ```python
 from gpiod_stepper_motors import HardwarePWM, VariableSpeedPWM
@@ -36,8 +43,32 @@ pwm.start_pwm()
 ramp.ramp_to(2000.0, duration_s=1.5)  # accelerate from 200 Hz to 2000 Hz
 ```
 
+```python
+from gpiod_stepper_motors import load_gpio_config
+from gpiod_stepper_motors.stepper import GPIODevice
+from gpiod_stepper_motors.protocol import GPIOValue, InputLabel, OutputLabel
+
+config = load_gpio_config("examples/gpio_config.yaml")
+device = GPIODevice(chip_path=config.chip_path, pin_mapping=config.pin_mapping)
+
+device.open()
+
+# set() accepts a configured label or a raw line offset
+device.set(OutputLabel.PUL, GPIOValue.ACTIVE)
+device.set(17, GPIOValue.INACTIVE)
+
+# is_active() returns a plain bool; get() returns the raw gpiod line value
+if device.is_active(InputLabel.ALARM):
+    print("ALARM line is asserted")
+
+raw_value = device.get(InputLabel.MAX_LIMIT)
+
+device.close()  # safe to call even if open() was never called, or called twice
+```
+
 GPIO offsets, PWM chip/channel numbers, and timing requirements are
-hardware- and driver-specific.
+hardware- and driver-specific. See `examples/gpio_config.yaml` and
+`examples/pwm_config.yaml` for runnable config templates.
 
 ## Dev tools
 

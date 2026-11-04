@@ -1,15 +1,25 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from collections.abc import Iterable
+from unittest.mock import MagicMock, call, patch
 
 import gpiod
 from gpiod.line import Direction as LineDirection
 from gpiod.line import Value
 
+from gpiod_stepper_motors.protocol import GPIOValue, InputLabel, OutputLabel
 from gpiod_stepper_motors.pwm import (
     HardwarePWM,
     PWMConfig,
     PWMRampConfig,
     VariableSpeedPWM,
+)
+from gpiod_stepper_motors.stepper import (
+    GPIOConfig,
+    GPIODevice,
+    GPIOStepper,
+    InputLine,
+    OutputLine,
+    Pull,
 )
 
 
@@ -30,7 +40,7 @@ class StepperMotorTests(unittest.TestCase):
         self.request = self.request_lines.return_value
 
     def make_request(self, chip="/dev/gpiochip0", consumer="gpiod-stepper-motors"):
-        config = {
+        config: dict[Iterable[int | str] | int | str, gpiod.LineSettings | None] = {
             self.STEP_PIN: gpiod.LineSettings(
                 direction=LineDirection.OUTPUT,
                 output_value=Value.INACTIVE,
@@ -60,9 +70,9 @@ class StepperMotorTests(unittest.TestCase):
         self.assertEqual(
             self.request.set_value.call_args_list,
             [
-                unittest.mock.call(self.DIR_PIN, Value.ACTIVE),
-                unittest.mock.call(self.STEP_PIN, Value.ACTIVE),
-                unittest.mock.call(self.STEP_PIN, Value.INACTIVE),
+                call(self.DIR_PIN, Value.ACTIVE),
+                call(self.STEP_PIN, Value.ACTIVE),
+                call(self.STEP_PIN, Value.INACTIVE),
             ],
         )
 
@@ -178,9 +188,13 @@ class VariableSpeedPWMTests(unittest.TestCase):
         self.sleep = self.sleep_patcher.start()
         self.addCleanup(self.sleep_patcher.stop)
 
-    def make_variable_speed_pwm(self, frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0):
+    def make_variable_speed_pwm(
+        self, frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0
+    ):
         config = PWMConfig(label="test", offset=12, frequency_hz=frequency_hz)
-        ramp_config = PWMRampConfig(target_freq_hz=target_freq_hz, ramp_duration_s=ramp_duration_s)
+        ramp_config = PWMRampConfig(
+            target_freq_hz=target_freq_hz, ramp_duration_s=ramp_duration_s
+        )
         return VariableSpeedPWM(HardwarePWM(config), ramp_config=ramp_config)
 
     def test_ramp_to_rejects_non_positive_target_frequency(self):
@@ -214,9 +228,12 @@ class VariableSpeedPWMTests(unittest.TestCase):
             vsp.ramp_to()
 
     def test_ramp_to_runs_in_background_thread_and_reaches_target(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0, target_freq_hz=300.0, ramp_duration_s=0.05)
+        vsp = self.make_variable_speed_pwm(
+            frequency_hz=100.0, target_freq_hz=300.0, ramp_duration_s=0.05
+        )
 
         vsp.ramp_to()
+        assert vsp._sweep_thread is not None
         vsp._sweep_thread.join(timeout=1)
 
         self.assertFalse(vsp._sweep_thread.is_alive())
@@ -234,9 +251,7 @@ class VariableSpeedPWMTests(unittest.TestCase):
         ) as set_freq:
             vsp._run_ramp()
 
-        expected = [
-            unittest.mock.call(100.0 + 300.0 * (i / steps)) for i in range(1, steps + 1)
-        ]
+        expected = [call(100.0 + 300.0 * (i / steps)) for i in range(1, steps + 1)]
         self.assertEqual(set_freq.call_args_list, expected)
         self.assertEqual(vsp.current_freq, 400.0)
 
@@ -251,7 +266,9 @@ class VariableSpeedPWMTests(unittest.TestCase):
         self.assertEqual(vsp.current_freq, 500.0)
 
     def test_run_ramp_stops_immediately_when_cancelled(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0)
+        vsp = self.make_variable_speed_pwm(
+            frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0
+        )
         vsp._cancel_event.set()
 
         with patch.object(vsp.pwm, "set_frequency") as set_freq:
@@ -260,7 +277,9 @@ class VariableSpeedPWMTests(unittest.TestCase):
         set_freq.assert_not_called()
 
     def test_run_ramp_stops_when_pwm_reports_fault(self):
-        vsp = self.make_variable_speed_pwm(frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0)
+        vsp = self.make_variable_speed_pwm(
+            frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0
+        )
         vsp.pwm._fault.set()
 
         with patch.object(vsp.pwm, "set_frequency") as set_freq:
@@ -283,6 +302,149 @@ class VariableSpeedPWMTests(unittest.TestCase):
         vsp._sweep_thread = broken_thread
 
         self.assertFalse(vsp.stop_sweep())
+
+
+class GPIODeviceTests(unittest.TestCase):
+    def setUp(self):
+        self.chip_patcher = patch("gpiod_stepper_motors.stepper.Chip")
+        self.chip_cls = self.chip_patcher.start()
+        self.addCleanup(self.chip_patcher.stop)
+        self.chip = self.chip_cls.return_value.__enter__.return_value
+        self.request = self.chip.request_lines.return_value
+        self.request.chip_name = "gpiochip0"
+
+    def default_pin_mapping(self):
+        return [
+            OutputLine(label=OutputLabel.PUL, offset=17),
+            InputLine(label=InputLabel.ALARM, offset=23, pull=Pull.UP),
+        ]
+
+    def make_device(self, pin_mapping=None):
+        return GPIODevice(
+            chip_path="/dev/gpiochip0",
+            pin_mapping=(
+                pin_mapping if pin_mapping is not None else self.default_pin_mapping()
+            ),
+        )
+
+    def test_claim_lines_requests_combined_input_and_output_config(self):
+        device = self.make_device()
+
+        device.claim_lines()
+
+        config = self.chip.request_lines.call_args.kwargs["config"]
+        self.assertEqual(config[17].direction, LineDirection.OUTPUT)
+        self.assertEqual(config[23].direction, LineDirection.INPUT)
+
+    def test_open_stores_claimed_line_request(self):
+        device = self.make_device()
+
+        device.open()
+
+        self.assertIs(device.line_request, self.request)
+
+    def test_open_wraps_claim_failure_and_cleans_up(self):
+        self.chip.request_lines.side_effect = RuntimeError("boom")
+        device = self.make_device()
+
+        with self.assertRaises(RuntimeError):
+            device.open()
+
+        self.assertIsNone(device.line_request)
+
+    def test_set_by_label_resolves_offset(self):
+        device = self.make_device()
+        device.open()
+
+        device.set(OutputLabel.PUL, GPIOValue.ACTIVE)
+
+        self.request.set_value.assert_called_once_with(17, Value.ACTIVE)
+
+    def test_set_by_offset_passes_through(self):
+        device = self.make_device()
+        device.open()
+
+        device.set(17, GPIOValue.INACTIVE)
+
+        self.request.set_value.assert_called_once_with(17, Value.INACTIVE)
+
+    def test_set_unknown_label_raises_key_error(self):
+        device = self.make_device()
+        device.open()
+
+        with self.assertRaises(KeyError):
+            device.set(OutputLabel.DIR, GPIOValue.ACTIVE)
+
+    def test_get_by_label_returns_value(self):
+        device = self.make_device()
+        device.open()
+        self.request.get_value.return_value = Value.ACTIVE
+
+        self.assertEqual(device.get(InputLabel.ALARM), Value.ACTIVE)
+        self.request.get_value.assert_called_once_with(23)
+
+    def test_get_unknown_label_raises_key_error(self):
+        device = self.make_device()
+        device.open()
+
+        with self.assertRaises(KeyError):
+            device.get(OutputLabel.DIR)
+
+    def test_is_active_reflects_line_value(self):
+        device = self.make_device()
+        device.open()
+
+        self.request.get_value.return_value = Value.ACTIVE
+        self.assertTrue(device.is_active(InputLabel.ALARM))
+
+        self.request.get_value.return_value = Value.INACTIVE
+        self.assertFalse(device.is_active(InputLabel.ALARM))
+
+    def test_close_releases_and_clears_request(self):
+        device = self.make_device()
+        device.open()
+
+        device.close()
+
+        self.request.release.assert_called_once()
+        self.assertIsNone(device.line_request)
+
+    def test_close_is_safe_before_open(self):
+        device = self.make_device()
+
+        device.close()  # must not raise
+
+        self.assertIsNone(device.line_request)
+
+    def test_close_is_safe_when_called_twice(self):
+        device = self.make_device()
+        device.open()
+
+        device.close()
+        device.close()  # must not raise
+
+        self.request.release.assert_called_once()
+
+
+class GPIOStepperTests(unittest.TestCase):
+    def make_config(self):
+        return GPIOConfig(
+            name="test",
+            pin_mapping=[OutputLine(label=OutputLabel.PUL, offset=17)],
+            pwm=PWMConfig(label="step", offset=17),
+        )
+
+    def test_uses_provided_gpio_backend_when_given(self):
+        fake_backend = MagicMock()
+
+        stepper = GPIOStepper(self.make_config(), gpio=fake_backend)
+
+        self.assertIs(stepper._gpio, fake_backend)
+
+    def test_constructs_gpio_device_when_backend_omitted(self):
+        stepper = GPIOStepper(self.make_config())
+
+        self.assertIsInstance(stepper._gpio, GPIODevice)
 
 
 if __name__ == "__main__":

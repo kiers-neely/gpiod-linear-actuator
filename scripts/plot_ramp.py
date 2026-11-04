@@ -12,7 +12,12 @@ import argparse
 import time
 from unittest.mock import patch
 
-from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, PWMRampConfig, VariableSpeedPWM
+from gpiod_stepper_motors.pwm import (
+    HardwarePWM,
+    PWMConfig,
+    PWMRampConfig,
+    VariableSpeedPWM,
+)
 
 
 def record_ramp(
