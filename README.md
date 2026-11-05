@@ -1,4 +1,4 @@
-# gpiod-stepper-motors
+# gpiod-linear-actuator
 
 A small Python library for driving stepper motors from a Raspberry Pi, using
 the official [`gpiod`](https://pypi.org/project/gpiod/) bindings for libgpiod
@@ -92,8 +92,8 @@ This is real code for actual hardware — no mocking, nothing simulated:
 ```python
 import asyncio
 
-from gpiod_stepper_motors import load_gpio_config
-from gpiod_stepper_motors.stepper import LinearActuatorControl, LinearActuatorState
+from gpiod_linear_actuator import load_gpio_config
+from gpiod_linear_actuator.stepper import LinearActuatorControl, LinearActuatorState
 
 
 async def main():
@@ -168,8 +168,8 @@ if actuator.alarm_active:
 or raw GPIO access without the homing/fault-handling behavior above.
 
 ```python
-from gpiod_stepper_motors import HardwarePWM
-from gpiod_stepper_motors.pwm import PWMConfig, PWMRampConfig
+from gpiod_linear_actuator import HardwarePWM
+from gpiod_linear_actuator.pwm import PWMConfig, PWMRampConfig
 
 pwm = HardwarePWM(
     PWMConfig(
@@ -188,9 +188,9 @@ pwm.stop_pwm()  # stops the ramp (if still running) and disables output together
 ```
 
 ```python
-from gpiod_stepper_motors import load_gpio_config
-from gpiod_stepper_motors.stepper import GPIOStepperDriver
-from gpiod_stepper_motors.protocol import GPIOValue, InputLabel, OutputLabel
+from gpiod_linear_actuator import load_gpio_config
+from gpiod_linear_actuator.stepper import GPIOStepperDriver
+from gpiod_linear_actuator.protocol import GPIOValue, InputLabel, OutputLabel
 
 config = load_gpio_config("examples/gpio_config.yaml")
 device = GPIOStepperDriver(chip_path=config.chip_path, pin_mapping=config.pin_mapping)
@@ -255,13 +255,13 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 from gpiod.line import Value
-from gpiod_stepper_motors import load_gpio_config
-from gpiod_stepper_motors.protocol import InputLabel
-from gpiod_stepper_motors.stepper import LinearActuatorControl, LinearActuatorState
+from gpiod_linear_actuator import load_gpio_config
+from gpiod_linear_actuator.protocol import InputLabel
+from gpiod_linear_actuator.stepper import LinearActuatorControl, LinearActuatorState
 
 
 async def main():
-    with patch("gpiod_stepper_motors.pwm.PWM"):  # no real PWM hardware needed
+    with patch("gpiod_linear_actuator.pwm.PWM"):  # no real PWM hardware needed
         config = load_gpio_config("examples/gpio_config.yaml")
 
         fake_gpio = MagicMock()

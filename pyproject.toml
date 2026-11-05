@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gpiod-stepper-motors"
+name = "gpiod-linear-actuator"
 version = "0.1.0"
 description = "A simple library for controlling stepper motor drivers with Raspberry Pi GPIO."
 readme = "README.md"

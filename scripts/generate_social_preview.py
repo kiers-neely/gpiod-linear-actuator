@@ -16,12 +16,12 @@ TITLE_COLOR = "#dcdfe4"
 MUTED = "#7f848e"
 GREEN = "#98c379"
 
-TITLE = "gpiod-stepper-motors"
+TITLE = "gpiod-linear-actuator"
 DESCRIPTION = (
     "A small Python library for driving stepper motors from a\n"
     "Raspberry Pi, using libgpiod and hardware PWM."
 )
-FOOTER = "kiers-neely/gpiod-stepper-motors"
+FOOTER = "kiers-neely/gpiod-linear-actuator"
 
 
 def load_font(path: str, size: int, weight: float) -> ImageFont.FreeTypeFont:

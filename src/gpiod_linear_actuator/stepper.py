@@ -134,7 +134,7 @@ class GPIOConfig(BaseModel):
     inputs) with the PWM channel that drives STEP. Consumed by
     `LinearActuatorControl`; `chip_path` and `pin_mapping` are also what
     `GPIOStepperDriver` is built from when no backend is injected. Can be
-    loaded from YAML via `gpiod_stepper_motors.load_gpio_config`.
+    loaded from YAML via `gpiod_linear_actuator.load_gpio_config`.
 
     Attributes:
         name: A human-readable identifier for this axis/motor, used in logs.

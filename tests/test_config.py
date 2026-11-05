@@ -4,14 +4,14 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from gpiod_stepper_motors.config import (
+from gpiod_linear_actuator.config import (
     load_gpio_config,
     load_pwm_config,
     load_pwm_ramp_config,
     load_yaml_config,
 )
-from gpiod_stepper_motors.pwm import PWMConfig, PWMRampConfig
-from gpiod_stepper_motors.stepper import GPIOConfig, InputLine, OutputLine
+from gpiod_linear_actuator.pwm import PWMConfig, PWMRampConfig
+from gpiod_linear_actuator.stepper import GPIOConfig, InputLine, OutputLine
 
 EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
 

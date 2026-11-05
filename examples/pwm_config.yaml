@@ -1,5 +1,5 @@
 # Example PWMConfig for a single hardware-PWM channel, with an optional ramp.
-# Load with: gpiod_stepper_motors.config.load_pwm_config("examples/pwm_config.yaml")
+# Load with: gpiod_linear_actuator.config.load_pwm_config("examples/pwm_config.yaml")
 label: step
 offset: 18
 chip: 0

@@ -4,8 +4,8 @@ from typing import TypeVar
 import yaml
 from pydantic import BaseModel
 
-from gpiod_stepper_motors.pwm import PWMConfig, PWMRampConfig
-from gpiod_stepper_motors.stepper import GPIOConfig
+from gpiod_linear_actuator.pwm import PWMConfig, PWMRampConfig
+from gpiod_linear_actuator.stepper import GPIOConfig
 
 ConfigT = TypeVar("ConfigT", bound=BaseModel)
 

@@ -9,9 +9,9 @@ from gpiod.line import Direction as LineDirection
 from gpiod.line import Value
 from pydantic import ValidationError
 
-from gpiod_stepper_motors.protocol import GPIOValue, InputLabel, OutputLabel
-from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, PWMRampConfig
-from gpiod_stepper_motors.stepper import (
+from gpiod_linear_actuator.protocol import GPIOValue, InputLabel, OutputLabel
+from gpiod_linear_actuator.pwm import HardwarePWM, PWMConfig, PWMRampConfig
+from gpiod_linear_actuator.stepper import (
     GPIOConfig,
     GPIOStepperDriver,
     InputLine,
@@ -39,7 +39,7 @@ class StepperMotorTests(unittest.TestCase):
         self.addCleanup(self.request_patcher.stop)
         self.request = self.request_lines.return_value
 
-    def make_request(self, chip="/dev/gpiochip0", consumer="gpiod-stepper-motors"):
+    def make_request(self, chip="/dev/gpiochip0", consumer="gpiod-linear-actuator"):
         config: dict[Iterable[int | str] | int | str, gpiod.LineSettings | None] = {
             self.STEP_PIN: gpiod.LineSettings(
                 direction=LineDirection.OUTPUT,
@@ -98,11 +98,11 @@ class PWMRampConfigTests(unittest.TestCase):
 
 class HardwarePWMTests(unittest.TestCase):
     def setUp(self):
-        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
+        self.pwm_patcher = patch("gpiod_linear_actuator.pwm.PWM")
         self.pwm_cls = self.pwm_patcher.start()
         self.addCleanup(self.pwm_patcher.stop)
         self.pwm = self.pwm_cls.return_value
-        self.sleep_patcher = patch("gpiod_stepper_motors.pwm.time.sleep")
+        self.sleep_patcher = patch("gpiod_linear_actuator.pwm.time.sleep")
         self.sleep = self.sleep_patcher.start()
         self.addCleanup(self.sleep_patcher.stop)
 
@@ -325,7 +325,7 @@ class HardwarePWMTests(unittest.TestCase):
 
 class GPIODeviceTests(unittest.TestCase):
     def setUp(self):
-        self.chip_patcher = patch("gpiod_stepper_motors.stepper.Chip")
+        self.chip_patcher = patch("gpiod_linear_actuator.stepper.Chip")
         self.chip_cls = self.chip_patcher.start()
         self.addCleanup(self.chip_patcher.stop)
         self.chip = self.chip_cls.return_value.__enter__.return_value
@@ -447,7 +447,7 @@ class GPIODeviceTests(unittest.TestCase):
 
 class GPIODeviceEdgeReaderTests(unittest.TestCase):
     def setUp(self):
-        self.chip_patcher = patch("gpiod_stepper_motors.stepper.Chip")
+        self.chip_patcher = patch("gpiod_linear_actuator.stepper.Chip")
         self.chip_cls = self.chip_patcher.start()
         self.addCleanup(self.chip_patcher.stop)
         self.chip = self.chip_cls.return_value.__enter__.return_value
@@ -573,7 +573,7 @@ class GPIODeviceEdgeReaderTests(unittest.TestCase):
 
 class GPIOStepperTests(unittest.TestCase):
     def setUp(self):
-        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
+        self.pwm_patcher = patch("gpiod_linear_actuator.pwm.PWM")
         self.pwm_patcher.start()
         self.addCleanup(self.pwm_patcher.stop)
 
@@ -599,10 +599,10 @@ class GPIOStepperTests(unittest.TestCase):
 
 class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
+        self.pwm_patcher = patch("gpiod_linear_actuator.pwm.PWM")
         self.pwm_cls = self.pwm_patcher.start()
         self.addCleanup(self.pwm_patcher.stop)
-        self.sleep_patcher = patch("gpiod_stepper_motors.pwm.time.sleep")
+        self.sleep_patcher = patch("gpiod_linear_actuator.pwm.time.sleep")
         self.sleep_patcher.start()
         self.addCleanup(self.sleep_patcher.stop)
 

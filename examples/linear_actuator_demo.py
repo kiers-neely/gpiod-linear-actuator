@@ -2,13 +2,13 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 from gpiod.line import Value
-from gpiod_stepper_motors import load_gpio_config
-from gpiod_stepper_motors.protocol import InputLabel
-from gpiod_stepper_motors.stepper import LinearActuatorControl, LinearActuatorState
+from gpiod_linear_actuator import load_gpio_config
+from gpiod_linear_actuator.protocol import InputLabel
+from gpiod_linear_actuator.stepper import LinearActuatorControl, LinearActuatorState
 
 
 async def main():
-    with patch("gpiod_stepper_motors.pwm.PWM"):  # no real PWM hardware needed
+    with patch("gpiod_linear_actuator.pwm.PWM"):  # no real PWM hardware needed
         config = load_gpio_config("examples/gpio_config.yaml")
 
         fake_gpio = MagicMock()

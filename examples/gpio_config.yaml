@@ -1,5 +1,5 @@
 # Example GPIOConfig: declarative pin mapping + PWM + ramp settings for one motor.
-# Load with: gpiod_stepper_motors.config.load_gpio_config("examples/gpio_config.yaml")
+# Load with: gpiod_linear_actuator.config.load_gpio_config("examples/gpio_config.yaml")
 name: x-axis
 chip_path: /dev/gpiochip0
 

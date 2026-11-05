@@ -12,7 +12,7 @@ import argparse
 import time
 from unittest.mock import patch
 
-from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, PWMRampConfig
+from gpiod_linear_actuator.pwm import HardwarePWM, PWMConfig, PWMRampConfig
 
 
 def record_ramp(
@@ -21,7 +21,7 @@ def record_ramp(
     """Run a sequence of (target_hz, duration_s) ramps back-to-back and record (time, hz) samples."""
     samples: list[tuple[float, float]] = []
 
-    with patch("gpiod_stepper_motors.pwm.PWM"):
+    with patch("gpiod_linear_actuator.pwm.PWM"):
         config = PWMConfig(label="plot", offset=1, frequency_hz=start_hz)
         pwm = HardwarePWM(config)
 
