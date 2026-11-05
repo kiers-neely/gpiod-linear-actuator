@@ -2,9 +2,10 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 from gpiod.line import Value
+
 from gpiod_linear_actuator import load_gpio_config
 from gpiod_linear_actuator.protocol import InputLabel
-from gpiod_linear_actuator.stepper import LinearActuatorControl, LinearActuatorState
+from gpiod_linear_actuator.linearactuator import LinearActuatorControl, LinearActuatorState
 
 
 async def main():

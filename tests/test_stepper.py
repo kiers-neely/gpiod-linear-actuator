@@ -9,14 +9,16 @@ from gpiod.line import Direction as LineDirection
 from gpiod.line import Value
 from pydantic import ValidationError
 
+from gpiod_linear_actuator.linearactuator import (
+    LinearActuatorControl,
+    LinearActuatorState,
+)
 from gpiod_linear_actuator.protocol import GPIOValue, InputLabel, OutputLabel
 from gpiod_linear_actuator.pwm import HardwarePWM, PWMConfig, PWMRampConfig
 from gpiod_linear_actuator.stepper import (
     GPIOConfig,
     GPIOStepperDriver,
     InputLine,
-    LinearActuatorControl,
-    LinearActuatorState,
     OutputLine,
     Pull,
 )
@@ -624,14 +626,18 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def make_connected_driver(self, **pwm_kwargs):
-        driver = LinearActuatorControl(self.make_config(**pwm_kwargs), gpio=self.fake_gpio)
+        driver = LinearActuatorControl(
+            self.make_config(**pwm_kwargs), gpio=self.fake_gpio
+        )
         await driver.connect()
         return driver
 
     # -- connect() --
 
     async def test_connect_registers_callbacks_and_seeds_limits(self):
-        self.fake_gpio.is_active.side_effect = lambda label: label == InputLabel.MIN_LIMIT
+        self.fake_gpio.is_active.side_effect = lambda label: (
+            label == InputLabel.MIN_LIMIT
+        )
         driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
 
         await driver.connect()
@@ -639,7 +645,8 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(driver.connected)
         registered_labels = {c.args[0] for c in self.fake_gpio.on_assert.call_args_list}
         self.assertEqual(
-            registered_labels, {InputLabel.MAX_LIMIT, InputLabel.MIN_LIMIT, InputLabel.ALARM}
+            registered_labels,
+            {InputLabel.MAX_LIMIT, InputLabel.MIN_LIMIT, InputLabel.ALARM},
         )
         self.assertEqual(
             driver._limit_reached,
@@ -724,20 +731,20 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
         driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
 
         with self.assertRaises(ValueError):
-            await driver.start_move(LinearActuatorState.MOVING)
+            await driver.move_to_target(LinearActuatorState.MOVING)
 
     async def test_start_move_requires_connection(self):
         driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
 
         with self.assertRaises(RuntimeError):
-            await driver.start_move(LinearActuatorState.END)
+            await driver.move_to_target(LinearActuatorState.END)
 
     async def test_start_move_refuses_while_alarm_active(self):
         driver = await self.make_connected_driver()
         driver._alarm_active = True
 
         with self.assertRaises(RuntimeError):
-            await driver.start_move(LinearActuatorState.END)
+            await driver.move_to_target(LinearActuatorState.END)
 
     async def test_start_move_refuses_when_already_moving(self):
         driver = await self.make_connected_driver()
@@ -746,13 +753,15 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
         driver._current_move = stuck_task
 
         with self.assertRaises(RuntimeError):
-            await driver.start_move(LinearActuatorState.END)
+            await driver.move_to_target(LinearActuatorState.END)
 
     async def test_start_move_returns_immediately_when_already_at_target(self):
         driver = await self.make_connected_driver()
-        self.fake_gpio.is_active.side_effect = lambda label: label == InputLabel.MAX_LIMIT
+        self.fake_gpio.is_active.side_effect = lambda label: (
+            label == InputLabel.MAX_LIMIT
+        )
 
-        await driver.start_move(LinearActuatorState.END)
+        await driver.move_to_target(LinearActuatorState.END)
 
         self.pwm_cls.return_value.enable.assert_not_called()
         self.assertIsNone(driver._current_move)
@@ -768,7 +777,7 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
             driver._on_limit(InputLabel.MAX_LIMIT)()
 
         asyncio.create_task(trip_soon())
-        await driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+        await driver.move_to_target(LinearActuatorState.END, max_duration_s=5.0)
 
         self.assertIsNone(driver._current_move)
         self.assertTrue(driver._limit_reached[InputLabel.MAX_LIMIT])
@@ -784,7 +793,7 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
             driver._on_alarm()
 
         asyncio.create_task(trip_soon())
-        await driver.start_move(LinearActuatorState.HOME, max_duration_s=5.0)
+        await driver.move_to_target(LinearActuatorState.HOME, max_duration_s=5.0)
 
         self.assertIsNone(driver._current_move)
         self.assertTrue(driver.alarm_active)
@@ -796,7 +805,7 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
         driver._drive_enabled = True
 
         with self.assertRaises(TimeoutError):
-            await driver.start_move(LinearActuatorState.END, max_duration_s=0.02)
+            await driver.move_to_target(LinearActuatorState.END, max_duration_s=0.02)
 
         self.assertIsNone(driver._current_move)
         self.pwm_cls.return_value.disable.assert_called_once()
@@ -810,7 +819,7 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
             driver._on_limit(InputLabel.MAX_LIMIT)()
 
         asyncio.create_task(trip_soon())
-        await driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+        await driver.move_to_target(LinearActuatorState.END, max_duration_s=5.0)
 
         self.assertTrue(driver.drive_enabled)
         self.fake_gpio.set.assert_any_call(OutputLabel.ENA, GPIOValue.ACTIVE)
@@ -825,7 +834,7 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
             driver._on_limit(InputLabel.MAX_LIMIT)()
 
         asyncio.create_task(trip_soon())
-        await driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+        await driver.move_to_target(LinearActuatorState.END, max_duration_s=5.0)
 
         ena_calls = [
             c for c in self.fake_gpio.set.call_args_list if c.args[0] == OutputLabel.ENA
@@ -837,7 +846,7 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
         driver._drive_enabled = True
 
         move_task = asyncio.create_task(
-            driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+            driver.move_to_target(LinearActuatorState.END, max_duration_s=5.0)
         )
         await asyncio.sleep(0.01)
 
@@ -870,7 +879,9 @@ class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refresh_limits_updates_both_limits_from_gpio(self):
         driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
-        self.fake_gpio.is_active.side_effect = lambda label: label == InputLabel.MIN_LIMIT
+        self.fake_gpio.is_active.side_effect = lambda label: (
+            label == InputLabel.MIN_LIMIT
+        )
 
         result = await driver.refresh_limits()
 

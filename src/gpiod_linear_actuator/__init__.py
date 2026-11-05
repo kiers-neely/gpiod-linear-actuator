@@ -1,17 +1,4 @@
-from .config import (
-    load_gpio_config,
-    load_pwm_config,
-    load_pwm_ramp_config,
-    load_yaml_config,
-)
-from .pwm import HardwarePWM
-from .stepper import LinearActuatorControl
-
-__all__ = [
-    "HardwarePWM",
-    "LinearActuatorControl",
-    "load_gpio_config",
-    "load_pwm_config",
-    "load_pwm_ramp_config",
-    "load_yaml_config",
-]
+from .linearactuator import LinearActuatorControl as LinearActuatorControl
+from .stepper import GPIOStepperDriver as GPIOStepperDriver
+from .protocol import GPIOBackend as GPIOBackend
+from .pwm import HardwarePWM as HardwarePWM
