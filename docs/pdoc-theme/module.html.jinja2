@@ -26,3 +26,27 @@
         true
     {% endif %}
 {% endmacro %}
+
+{% block nav_submodules %}
+    {#
+    pdoc's default `module.submodules` only lists submodules named in the
+    package's __all__. Since __all__ here curates the top-level re-exported
+    API rather than naming submodules, that leaves the sidebar with no link
+    to config/protocol/pwm/stepper. List direct submodules from all_modules
+    instead, ignoring __all__.
+    #}
+    {% set direct_submodules = [] %}
+    {% for name, mod in all_modules.items() %}
+        {% if name.startswith(module.modulename ~ ".") and name.count(".") == module.modulename.count(".") + 1 %}
+            {% set _ = direct_submodules.append(mod) %}
+        {% endif %}
+    {% endfor %}
+    {% if direct_submodules %}
+        <h2>Submodules</h2>
+        <ul>
+            {% for submodule in direct_submodules if is_public(submodule) | trim %}
+                <li>{{ submodule.taken_from | link(text=submodule.name) }}</li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+{% endblock %}
