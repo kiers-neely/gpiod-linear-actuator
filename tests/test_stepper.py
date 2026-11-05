@@ -7,13 +7,10 @@ import gpiod
 from gpiod.line import Direction as LineDirection
 from gpiod.line import Value
 
+from pydantic import ValidationError
+
 from gpiod_stepper_motors.protocol import GPIOValue, InputLabel, OutputLabel
-from gpiod_stepper_motors.pwm import (
-    HardwarePWM,
-    PWMConfig,
-    PWMRampConfig,
-    VariableSpeedPWM,
-)
+from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, PWMRampConfig
 from gpiod_stepper_motors.stepper import (
     GPIOConfig,
     GPIODevice,
@@ -86,16 +83,41 @@ class StepperMotorTests(unittest.TestCase):
         self.request.release.assert_called_once()
 
 
+class PWMRampConfigTests(unittest.TestCase):
+    def test_rejects_non_positive_target_frequency(self):
+        with self.assertRaises(ValidationError):
+            PWMRampConfig(target_freq_hz=0, ramp_duration_s=1.0)
+        with self.assertRaises(ValidationError):
+            PWMRampConfig(target_freq_hz=-10, ramp_duration_s=1.0)
+
+    def test_rejects_negative_duration(self):
+        with self.assertRaises(ValidationError):
+            PWMRampConfig(target_freq_hz=500.0, ramp_duration_s=-1.0)
+
+
 class HardwarePWMTests(unittest.TestCase):
     def setUp(self):
         self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
         self.pwm_cls = self.pwm_patcher.start()
         self.addCleanup(self.pwm_patcher.stop)
         self.pwm = self.pwm_cls.return_value
+        self.sleep_patcher = patch("gpiod_stepper_motors.pwm.time.sleep")
+        self.sleep = self.sleep_patcher.start()
+        self.addCleanup(self.sleep_patcher.stop)
 
     def make_pwm(self, **kwargs):
         config = PWMConfig(label="test", offset=12, **kwargs)
         return HardwarePWM(config)
+
+    def make_ramping_pwm(
+        self, frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0
+    ):
+        return self.make_pwm(
+            frequency_hz=frequency_hz,
+            ramp_config=PWMRampConfig(
+                target_freq_hz=target_freq_hz, ramp_duration_s=ramp_duration_s
+            ),
+        )
 
     def test_initializes_hardware_with_configured_chip_and_channel(self):
         self.make_pwm(chip=2, channel=1, frequency_hz=500.0, duty_cycle=0.25)
@@ -117,6 +139,13 @@ class HardwarePWMTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pwm.set_frequency(-10)
 
+    def test_set_frequency_updates_current_freq(self):
+        pwm = self.make_pwm(frequency_hz=100.0)
+
+        pwm.set_frequency(250.0)
+
+        self.assertEqual(pwm.current_freq, 250.0)
+
     def test_set_duty_cycle_rejects_out_of_range_values(self):
         pwm = self.make_pwm()
 
@@ -125,12 +154,37 @@ class HardwarePWMTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pwm.set_duty_cycle(1.1)
 
-    def test_start_pwm_enables_output_when_not_faulted(self):
-        pwm = self.make_pwm()
+    def test_start_pwm_without_ramp_config_just_enables(self):
+        pwm = self.make_pwm(frequency_hz=500.0)
 
         pwm.start_pwm()
 
         self.pwm.enable.assert_called_once()
+        self.assertEqual(self.pwm.frequency, 500.0)
+        self.assertIsNone(pwm._sweep_thread)
+
+    def test_start_pwm_with_ramp_config_enables_and_ramps_to_target(self):
+        pwm = self.make_ramping_pwm(
+            frequency_hz=100.0, target_freq_hz=300.0, ramp_duration_s=0.05
+        )
+
+        pwm.start_pwm()
+
+        self.pwm.enable.assert_called_once()
+        assert pwm._sweep_thread is not None
+        pwm._sweep_thread.join(timeout=1)
+        self.assertFalse(pwm._sweep_thread.is_alive())
+        self.assertEqual(pwm.current_freq, 300.0)
+        self.assertEqual(self.pwm.frequency, 300.0)
+
+    def test_start_pwm_raises_if_previous_ramp_still_running(self):
+        pwm = self.make_ramping_pwm()
+        stuck_thread = MagicMock()
+        stuck_thread.is_alive.return_value = True
+        pwm._sweep_thread = stuck_thread
+
+        with self.assertRaises(RuntimeError):
+            pwm.start_pwm()
 
     def test_start_pwm_refuses_when_faulted(self):
         pwm = self.make_pwm()
@@ -158,6 +212,88 @@ class HardwarePWMTests(unittest.TestCase):
 
         self.assertTrue(pwm._is_faulted)
 
+    def test_stop_pwm_stops_sweep_before_disabling_hardware(self):
+        pwm = self.make_pwm()
+        manager = MagicMock()
+        manager.attach_mock(patch.object(pwm, "_stop_sweep").start(), "stop_sweep")
+        manager.attach_mock(patch.object(self.pwm, "disable").start(), "disable")
+        self.addCleanup(patch.stopall)
+
+        pwm.stop_pwm()
+
+        manager.stop_sweep.assert_called_once()
+        manager.disable.assert_called_once()
+        self.assertEqual([c[0] for c in manager.mock_calls], ["stop_sweep", "disable"])
+
+    def test_stop_pwm_stops_an_in_progress_ramp_thread(self):
+        pwm = self.make_ramping_pwm(
+            frequency_hz=100.0, target_freq_hz=2000.0, ramp_duration_s=1.0
+        )
+        pwm.start_pwm()
+        assert pwm._sweep_thread is not None
+
+        pwm.stop_pwm()
+
+        self.assertFalse(pwm._sweep_thread.is_alive())
+        self.pwm.disable.assert_called_once()
+
+    def test_run_ramp_interpolates_frequency_linearly(self):
+        steps = 3
+        pwm = self.make_pwm(frequency_hz=100.0)
+        ramp_config = PWMRampConfig(target_freq_hz=400.0, ramp_duration_s=steps / 100)
+
+        with patch.object(pwm, "set_frequency", wraps=pwm.set_frequency) as set_freq:
+            pwm._run_ramp(ramp_config)
+
+        expected = [call(100.0 + 300.0 * (i / steps)) for i in range(1, steps + 1)]
+        self.assertEqual(set_freq.call_args_list, expected)
+        self.assertEqual(pwm.current_freq, 400.0)
+
+    def test_run_ramp_sets_frequency_directly_when_duration_rounds_to_zero_steps(self):
+        pwm = self.make_pwm(frequency_hz=100.0)
+        ramp_config = PWMRampConfig(target_freq_hz=500.0, ramp_duration_s=0.001)
+
+        pwm._run_ramp(ramp_config)
+
+        self.assertEqual(self.pwm.frequency, 500.0)
+        self.assertEqual(pwm.current_freq, 500.0)
+
+    def test_run_ramp_stops_immediately_when_cancelled(self):
+        pwm = self.make_pwm(frequency_hz=100.0)
+        ramp_config = PWMRampConfig(target_freq_hz=500.0, ramp_duration_s=1.0)
+        pwm._cancel_event.set()
+
+        with patch.object(pwm, "set_frequency") as set_freq:
+            pwm._run_ramp(ramp_config)
+
+        set_freq.assert_not_called()
+
+    def test_run_ramp_stops_when_pwm_reports_fault(self):
+        pwm = self.make_pwm(frequency_hz=100.0)
+        ramp_config = PWMRampConfig(target_freq_hz=500.0, ramp_duration_s=1.0)
+        pwm._fault.set()
+
+        with patch.object(pwm, "set_frequency") as set_freq:
+            pwm._run_ramp(ramp_config)
+
+        set_freq.assert_not_called()
+        self.assertTrue(pwm._cancel_event.is_set())
+
+    def test_stop_sweep_returns_true_when_no_thread_running(self):
+        pwm = self.make_pwm()
+
+        self.assertTrue(pwm._stop_sweep())
+        self.assertTrue(pwm._cancel_event.is_set())
+
+    def test_stop_sweep_returns_false_when_join_raises(self):
+        pwm = self.make_pwm()
+        broken_thread = MagicMock()
+        broken_thread.is_alive.return_value = True
+        broken_thread.join.side_effect = RuntimeError("boom")
+        pwm._sweep_thread = broken_thread
+
+        self.assertFalse(pwm._stop_sweep())
+
     def test_clear_fault_resets_faulted_state(self):
         pwm = self.make_pwm()
         pwm._fault.set()
@@ -173,137 +309,17 @@ class HardwarePWMTests(unittest.TestCase):
 
         self.assertTrue(pwm._is_enabled)
 
-    def test_close_hardware_closes_underlying_pwm(self):
-        pwm = self.make_pwm()
+    def test_close_hardware_stops_sweep_and_closes_underlying_pwm(self):
+        pwm = self.make_ramping_pwm(
+            frequency_hz=100.0, target_freq_hz=2000.0, ramp_duration_s=1.0
+        )
+        pwm.start_pwm()
+        assert pwm._sweep_thread is not None
 
         pwm.close_hardware()
 
+        self.assertFalse(pwm._sweep_thread.is_alive())
         self.pwm.close.assert_called_once()
-
-
-class VariableSpeedPWMTests(unittest.TestCase):
-    def setUp(self):
-        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
-        self.pwm_cls = self.pwm_patcher.start()
-        self.addCleanup(self.pwm_patcher.stop)
-        self.sleep_patcher = patch("gpiod_stepper_motors.pwm.time.sleep")
-        self.sleep = self.sleep_patcher.start()
-        self.addCleanup(self.sleep_patcher.stop)
-
-    def make_variable_speed_pwm(
-        self, frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0
-    ):
-        config = PWMConfig(label="test", offset=12, frequency_hz=frequency_hz)
-        ramp_config = PWMRampConfig(
-            target_freq_hz=target_freq_hz, ramp_duration_s=ramp_duration_s
-        )
-        return VariableSpeedPWM(HardwarePWM(config), ramp_config=ramp_config)
-
-    def test_ramp_to_rejects_non_positive_target_frequency(self):
-        vsp = self.make_variable_speed_pwm()
-
-        vsp.target_freq = 0
-        with self.assertRaises(ValueError):
-            vsp.ramp_to()
-
-        vsp.target_freq = -10
-        with self.assertRaises(ValueError):
-            vsp.ramp_to()
-
-        self.assertIsNone(vsp._sweep_thread)
-
-    def test_ramp_to_rejects_negative_duration(self):
-        vsp = self.make_variable_speed_pwm()
-        vsp.ramp_duration = -1.0
-
-        with self.assertRaises(ValueError):
-            vsp.ramp_to()
-        self.assertIsNone(vsp._sweep_thread)
-
-    def test_ramp_to_raises_if_previous_ramp_still_running(self):
-        vsp = self.make_variable_speed_pwm()
-        stuck_thread = MagicMock()
-        stuck_thread.is_alive.return_value = True
-        vsp._sweep_thread = stuck_thread
-
-        with self.assertRaises(RuntimeError):
-            vsp.ramp_to()
-
-    def test_ramp_to_runs_in_background_thread_and_reaches_target(self):
-        vsp = self.make_variable_speed_pwm(
-            frequency_hz=100.0, target_freq_hz=300.0, ramp_duration_s=0.05
-        )
-
-        vsp.ramp_to()
-        assert vsp._sweep_thread is not None
-        vsp._sweep_thread.join(timeout=1)
-
-        self.assertFalse(vsp._sweep_thread.is_alive())
-        self.assertEqual(vsp.current_freq, 300.0)
-        self.assertEqual(self.pwm_cls.return_value.frequency, 300.0)
-
-    def test_run_ramp_interpolates_frequency_linearly(self):
-        steps = 3
-        vsp = self.make_variable_speed_pwm(
-            frequency_hz=100.0, target_freq_hz=400.0, ramp_duration_s=steps / 100
-        )
-
-        with patch.object(
-            vsp.pwm, "set_frequency", wraps=vsp.pwm.set_frequency
-        ) as set_freq:
-            vsp._run_ramp()
-
-        expected = [call(100.0 + 300.0 * (i / steps)) for i in range(1, steps + 1)]
-        self.assertEqual(set_freq.call_args_list, expected)
-        self.assertEqual(vsp.current_freq, 400.0)
-
-    def test_run_ramp_sets_frequency_directly_when_duration_rounds_to_zero_steps(self):
-        vsp = self.make_variable_speed_pwm(
-            frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=0.001
-        )
-
-        vsp._run_ramp()
-
-        self.assertEqual(self.pwm_cls.return_value.frequency, 500.0)
-        self.assertEqual(vsp.current_freq, 500.0)
-
-    def test_run_ramp_stops_immediately_when_cancelled(self):
-        vsp = self.make_variable_speed_pwm(
-            frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0
-        )
-        vsp._cancel_event.set()
-
-        with patch.object(vsp.pwm, "set_frequency") as set_freq:
-            vsp._run_ramp()
-
-        set_freq.assert_not_called()
-
-    def test_run_ramp_stops_when_pwm_reports_fault(self):
-        vsp = self.make_variable_speed_pwm(
-            frequency_hz=100.0, target_freq_hz=500.0, ramp_duration_s=1.0
-        )
-        vsp.pwm._fault.set()
-
-        with patch.object(vsp.pwm, "set_frequency") as set_freq:
-            vsp._run_ramp()
-
-        set_freq.assert_not_called()
-        self.assertTrue(vsp._cancel_event.is_set())
-
-    def test_stop_sweep_returns_true_when_no_thread_running(self):
-        vsp = self.make_variable_speed_pwm()
-
-        self.assertTrue(vsp.stop_sweep())
-        self.assertTrue(vsp._cancel_event.is_set())
-
-    def test_stop_sweep_returns_false_when_join_raises(self):
-        vsp = self.make_variable_speed_pwm()
-        broken_thread = MagicMock()
-        broken_thread.is_alive.return_value = True
-        broken_thread.join.side_effect = RuntimeError("boom")
-        vsp._sweep_thread = broken_thread
-
-        self.assertFalse(vsp.stop_sweep())
 
 
 class GPIODeviceTests(unittest.TestCase):
@@ -553,6 +569,11 @@ class GPIODeviceEdgeReaderTests(unittest.TestCase):
 
 
 class GPIOStepperTests(unittest.TestCase):
+    def setUp(self):
+        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
+        self.pwm_patcher.start()
+        self.addCleanup(self.pwm_patcher.stop)
+
     def make_config(self):
         return GPIOConfig(
             name="test",

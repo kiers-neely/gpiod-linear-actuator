@@ -17,32 +17,36 @@ uv sync
 
 - **`HardwarePWM`** — wraps a single hardware-timed PWM channel (frequency,
   duty cycle, enable/disable, fault tracking) via `python-periphery`.
-- **`VariableSpeedPWM`** — drives a `HardwarePWM` through a linear frequency
-  ramp on a background thread, for accelerating/decelerating a STEP signal
-  rather than jumping straight to a target speed.
+  `start_pwm()`/`stop_pwm()` are the only two verbs a caller needs: if
+  `PWMConfig.ramp_config` is set, `start_pwm()` ramps up to it on a
+  background thread instead of jumping straight to a fixed frequency, and
+  `stop_pwm()` always stops that ramp (if any) before disabling output, so
+  there's a single source of truth regardless of whether ramping is
+  configured.
 - **`GPIODevice`** — claims a declarative pin mapping (STEP/DIR/ENA outputs,
   ALARM/limit-switch inputs) as a single `gpiod` line request, and exposes
   `open`/`close`/`get`/`set`/`is_active`. Input lines can also raise a
   synchronous callback when they become active via `on_assert`, dispatched
   through `asyncio`'s `loop.add_reader` with no polling or background
   thread.
-- **`GPIOStepperDriver`** — ties a `GPIOConfig` (pin mapping + PWM + ramp
-  settings) together with a `GPIODevice`. Still a thin shell; stepping
-  logic isn't implemented yet.
+- **`GPIOStepperDriver`** — ties a `GPIOConfig` (pin mapping + PWM channel)
+  together with a `GPIODevice`. Still a thin shell; stepping logic isn't
+  implemented yet.
 - **`load_gpio_config`/`load_pwm_config`/`load_pwm_ramp_config`** — load any
   of this library's pydantic config models from a YAML file.
 
 ```python
-from gpiod_stepper_motors import HardwarePWM, VariableSpeedPWM
-from gpiod_stepper_motors.pwm import PWMConfig
+from gpiod_stepper_motors import HardwarePWM
+from gpiod_stepper_motors.pwm import PWMConfig, PWMRampConfig
 
-pwm = HardwarePWM(
-    PWMConfig(label="step", offset=18, chip=0, channel=0, frequency_hz=200.0)
-)
-ramp = VariableSpeedPWM(pwm)
+pwm = HardwarePWM(PWMConfig(
+    label="step", offset=18, chip=0, channel=0, frequency_hz=200.0,
+    ramp_config=PWMRampConfig(target_freq_hz=2000.0, ramp_duration_s=1.5),
+))
 
-pwm.start_pwm()
-ramp.ramp_to(2000.0, duration_s=1.5)  # accelerate from 200 Hz to 2000 Hz
+pwm.start_pwm()  # enables output, then ramps 200 Hz -> 2000 Hz in the background
+...
+pwm.stop_pwm()  # stops the ramp (if still running) and disables output together
 ```
 
 ```python
@@ -88,8 +92,8 @@ uv run pytest
 uv run ruff check .
 ```
 
-`scripts/plot_ramp.py` plots a `VariableSpeedPWM` ramp with matplotlib,
-using a mocked PWM device so it runs without any real hardware:
+`scripts/plot_ramp.py` plots a `HardwarePWM` ramp with matplotlib, using a
+mocked PWM device so it runs without any real hardware:
 
 ```sh
 uv run scripts/plot_ramp.py --start 100 --target 2000 --duration 1.5

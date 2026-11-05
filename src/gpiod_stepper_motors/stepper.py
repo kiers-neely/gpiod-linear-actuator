@@ -13,7 +13,7 @@ from gpiod.line_settings import LineSettings
 from loguru import logger
 from pydantic import BaseModel, PositiveInt
 
-from gpiod_stepper_motors.pwm import PWMConfig, PWMRampConfig
+from .pwm import HardwarePWM, PWMConfig
 
 from .protocol import GPIOBackend, GPIOValue, InputLabel, OutputLabel
 
@@ -98,10 +98,10 @@ class GPIOConfig(BaseModel):
     """Full declarative configuration for one stepper motor axis.
 
     Combines a GPIO pin mapping (STEP/DIR/ENA outputs, ALARM/limit-switch
-    inputs) with the PWM channel that drives STEP and an optional velocity
-    ramp profile. Consumed by `GPIOStepperDriver`; `chip_path` and `pin_mapping`
-    are also what `GPIODevice` is built from when no backend is injected.
-    Can be loaded from YAML via `gpiod_stepper_motors.load_gpio_config`.
+    inputs) with the PWM channel that drives STEP. Consumed by
+    `GPIOStepperDriver`; `chip_path` and `pin_mapping` are also what
+    `GPIODevice` is built from when no backend is injected. Can be loaded
+    from YAML via `gpiod_stepper_motors.load_gpio_config`.
 
     Attributes:
         name: A human-readable identifier for this axis/motor, used in logs.
@@ -110,9 +110,8 @@ class GPIOConfig(BaseModel):
             (STEP/DIR/ENA-style outputs) and `InputLine` (ALARM/limit-switch
             inputs) entries.
         pwm: Hardware PWM channel configuration driving the STEP signal.
-        velocity_profile: Optional acceleration/deceleration ramp settings.
-            `None` means the motor runs at a fixed `pwm.frequency_hz` with
-            no ramping.
+            Set `pwm.ramp_config` to have the motor accelerate/decelerate
+            instead of running at a fixed `pwm.frequency_hz`.
 
     Example:
         >>> load_gpio_config("examples/gpio_config.yaml")
@@ -123,7 +122,6 @@ class GPIOConfig(BaseModel):
     chip_path: str = "/dev/gpiochip0"
     pin_mapping: list[InputLine | OutputLine]
     pwm: PWMConfig
-    velocity_profile: PWMRampConfig | None = None
 
 
 class GPIODevice(GPIOBackend):
@@ -375,12 +373,12 @@ class GPIODevice(GPIOBackend):
 class GPIOStepperDriver:
     """Asynchronous GPIO stepper driver control class.
 
-    Ties a `GPIOConfig` (pin mapping, PWM channel, optional ramp) to a
-    `GPIOBackend`. Stepping logic itself isn't implemented yet.
+    Ties a `GPIOConfig` (pin mapping, PWM channel) to a `GPIOBackend`.
+    Stepping logic itself isn't implemented yet.
 
     Args:
-        config: The pin mapping, PWM channel, and optional ramp settings
-            for this motor axis.
+        config: The pin mapping and PWM channel (with its optional ramp
+            settings) for this motor axis.
         gpio: The `GPIOBackend` to drive. Defaults to a real `GPIODevice`
             built from `config.chip_path`/`config.pin_mapping` when
             omitted; pass one explicitly to inject a test double.
@@ -388,8 +386,39 @@ class GPIOStepperDriver:
 
     def __init__(self, config: GPIOConfig, gpio: GPIOBackend | None = None):
         self._config = config
-        self._gpio = (
+        self._name = config.name
+        self._gpio = (  # construct real device if a mock has not been injected
             gpio
             if gpio is not None
             else GPIODevice(chip_path=config.chip_path, pin_mapping=config.pin_mapping)
         )
+        # ramping is handled internally by HardwarePWM.start_pwm()/stop_pwm()
+        # if config.pwm.ramp_config is set
+        self._pwm: HardwarePWM = HardwarePWM(config.pwm)
+
+        self._alarm_active = False
+        self._limit_reached: dict[InputLabel, bool] = {}
+        self._current_move: asyncio.Task | None = None
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def initialize_hardware(self) -> None:
+        logger.debug("Attempting to initialize GPIO device")
+        self._gpio.open()
+
+    def _on_alarm(self) -> None:
+        self._alarm_active = True
+        if self._current_move is not None:
+            self._current_move.cancel()
+
+    def _on_limit(self, limit: InputLabel) -> Callable[[], None]:
+        def handler() -> None:
+            self._limit_reached[limit] = True
+            if self._current_move is not None:
+                self._current_move.cancel()
+        return handler
+
+    def _stop_move(self) -> None:
+        self._pwm.stop_pwm()

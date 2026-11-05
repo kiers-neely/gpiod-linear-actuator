@@ -44,8 +44,8 @@ class YamlConfigLoaderTests(unittest.TestCase):
         self.assertIsInstance(config.pin_mapping[0], OutputLine)
         self.assertIsInstance(config.pin_mapping[-1], InputLine)
         self.assertEqual(config.pwm.label, "step")
-        assert config.velocity_profile is not None
-        self.assertEqual(config.velocity_profile.ramp_duration_s, 1.5)
+        assert config.pwm.ramp_config is not None
+        self.assertEqual(config.pwm.ramp_config.ramp_duration_s, 1.5)
 
     def test_load_pwm_ramp_config_from_yaml(self):
         path = self.write_yaml("target_freq_hz: 500.0\nramp_duration_s: 0.75\n")

@@ -1,4 +1,4 @@
-"""Plot a VariableSpeedPWM ramp without any real GPIO/PWM hardware.
+"""Plot a HardwarePWM ramp without any real GPIO/PWM hardware.
 
 Usage:
     uv run scripts/plot_ramp.py --start 100 --target 2000 --duration 1.5
@@ -12,12 +12,7 @@ import argparse
 import time
 from unittest.mock import patch
 
-from gpiod_stepper_motors.pwm import (
-    HardwarePWM,
-    PWMConfig,
-    PWMRampConfig,
-    VariableSpeedPWM,
-)
+from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, PWMRampConfig
 
 
 def record_ramp(
@@ -29,8 +24,6 @@ def record_ramp(
     with patch("gpiod_stepper_motors.pwm.PWM"):
         config = PWMConfig(label="plot", offset=1, frequency_hz=start_hz)
         pwm = HardwarePWM(config)
-        ramp_config = PWMRampConfig(target_freq_hz=start_hz, ramp_duration_s=0.0)
-        ramp = VariableSpeedPWM(pwm, ramp_config=ramp_config)
 
         start_time = time.monotonic()
         original_set_frequency = pwm.set_frequency
@@ -45,10 +38,11 @@ def record_ramp(
         for target_hz, duration_s in segments:
             if duration_s <= 0:
                 continue
-            ramp.target_freq = target_hz
-            ramp.ramp_duration = duration_s
-            ramp.ramp_to()
-            ramp._sweep_thread.join(timeout=duration_s + 5)
+            pwm._ramp_to(
+                PWMRampConfig(target_freq_hz=target_hz, ramp_duration_s=duration_s)
+            )
+            assert pwm._sweep_thread is not None
+            pwm._sweep_thread.join(timeout=duration_s + 5)
 
     return samples
 
@@ -118,12 +112,12 @@ def main() -> None:
             (end_hz, args.decel_duration),
         ]
         title = (
-            f"VariableSpeedPWM accel/decel: {args.start} -> {args.peak} -> {end_hz} Hz"
+            f"HardwarePWM accel/decel: {args.start} -> {args.peak} -> {end_hz} Hz"
         )
     else:
         target_hz = 1000.0 if args.target is None else args.target
         segments = [(target_hz, args.duration)]
-        title = f"VariableSpeedPWM ramp: {args.start} Hz -> {target_hz} Hz over {args.duration}s"
+        title = f"HardwarePWM ramp: {args.start} Hz -> {target_hz} Hz over {args.duration}s"
 
     samples = record_ramp(args.start, segments)
     times, freqs = zip(*samples)

@@ -19,7 +19,7 @@ pin_mapping:
     pull: UP
     normally_closed: true
   - label: MIN_LIMIT
-    offset: 22
+    offset: 25
     pull: UP
     normally_closed: true
 
@@ -30,7 +30,6 @@ pwm:
   channel: 0
   frequency_hz: 200.0
   duty_cycle: 0.5
-
-velocity_profile:
-  target_freq_hz: 2000.0
-  ramp_duration_s: 1.5
+  ramp_config:
+    target_freq_hz: 2000.0
+    ramp_duration_s: 1.5

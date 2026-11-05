@@ -3,15 +3,15 @@ import time
 
 from loguru import logger
 from periphery import PWM, PWMError
-from pydantic import BaseModel, NonNegativeInt, PositiveInt
+from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
 
 
 class PWMRampConfig(BaseModel):
-    """Linear acceleration/deceleration profile for a `VariableSpeedPWM` ramp.
+    """Linear acceleration/deceleration profile for a `HardwarePWM` channel.
 
-    Describes a single ramp segment: move from whatever frequency the PWM
-    channel is currently at to `target_freq_hz`, over `ramp_duration_s`
-    seconds, via linear interpolation.
+    Describes a single ramp segment: once PWM output is enabled, move from
+    the channel's starting frequency to `target_freq_hz`, over
+    `ramp_duration_s` seconds, via linear interpolation.
 
     Attributes:
         target_freq_hz: The frequency, in Hz, to ramp to. Must be greater
@@ -20,8 +20,8 @@ class PWMRampConfig(BaseModel):
             non-negative; 0 jumps directly to `target_freq_hz`.
     """
 
-    target_freq_hz: float
-    ramp_duration_s: float
+    target_freq_hz: PositiveFloat
+    ramp_duration_s: NonNegativeFloat
 
 
 class PWMConfig(BaseModel):
@@ -29,8 +29,8 @@ class PWMConfig(BaseModel):
 
     Describes one PWM channel on a Raspberry Pi (via `python-periphery`)
     and its starting frequency/duty cycle. Optionally embeds a
-    `PWMRampConfig` describing the ramp a `VariableSpeedPWM` built on top
-    of this channel should run.
+    `PWMRampConfig`: when set, `HardwarePWM.start_pwm()` ramps up to it
+    instead of jumping straight to a fixed frequency.
 
     Attributes:
         label: A human-readable identifier for this PWM channel, used in
@@ -40,8 +40,8 @@ class PWMConfig(BaseModel):
         channel: The PWM channel number on `chip`.
         frequency_hz: The initial PWM frequency, in Hz.
         duty_cycle: The initial duty cycle, between 0.0 and 1.0.
-        ramp_config: Optional ramp settings for use with `VariableSpeedPWM`.
-            `None` means no ramp is configured for this channel.
+        ramp_config: Optional ramp settings. `None` means `start_pwm()`
+            just enables output at `frequency_hz` with no ramping.
     """
 
     label: str
@@ -61,13 +61,22 @@ class HardwarePWM:
     write or an enable/disable call fails. Once faulted, `start_pwm`
     refuses to re-enable output until `_clear_fault` is called.
 
+    `start_pwm`/`stop_pwm` are the only two verbs a caller needs: whether
+    output ramps up to `config.ramp_config.target_freq_hz` or jumps
+    straight to `config.frequency_hz` is an internal detail driven entirely
+    by whether `config.ramp_config` is set, not something the caller has
+    to decide between two different objects.
+
     Args:
-        config: The PWM channel's chip/channel, starting frequency, and
-            starting duty cycle. The device is initialized with these
-            values immediately on construction.
+        config: The PWM channel's chip/channel, starting frequency, starting
+            duty cycle, and optional ramp settings. The device is
+            initialized with the frequency/duty cycle immediately on
+            construction.
 
     Attributes:
         config: The `PWMConfig` this instance was constructed with.
+        current_freq: The last frequency successfully applied to the
+            hardware, kept up to date by every `set_frequency()` call.
     """
 
     def __init__(self, config: PWMConfig):
@@ -75,6 +84,9 @@ class HardwarePWM:
         self._pwm = PWM(chip=config.chip, channel=config.channel)
         self._fault = threading.Event()
         self._fault.clear()
+        self.current_freq: float = config.frequency_hz
+        self._sweep_thread: threading.Thread | None = None
+        self._cancel_event = threading.Event()
         logger.debug("Initializing hardware PWM device...")
         self._initialize_hardware()
 
@@ -84,6 +96,8 @@ class HardwarePWM:
         logger.debug(f"GPIO{self.config.offset} claimed for hardware-timed PWM.")
 
     def close_hardware(self):
+        """Stop any in-progress ramp and close the underlying PWM device."""
+        self._stop_sweep()
         try:
             self._pwm.close()
         except Exception as e:
@@ -96,6 +110,7 @@ class HardwarePWM:
             raise ValueError("Frequency must be greater than 0")
         try:
             self._pwm.frequency = hz
+            self.current_freq = hz
         except PWMError as e:
             self._fault.set()
             logger.error(f"Failed to set frequency: {e}")
@@ -109,7 +124,13 @@ class HardwarePWM:
             self._fault.set()
             logger.error(f"Failed to set duty cycle: {e}")
 
-    def start_pwm(self):
+    def start_pwm(self) -> None:
+        """Enable PWM output.
+
+        If `config.ramp_config` is set, ramps up to its target frequency on
+        a background thread after enabling; otherwise output simply runs
+        at `current_freq`.
+        """
         if self._fault.is_set():
             logger.error(
                 "Cannot enable PWM output while faulted. Clear fault and try again"
@@ -123,7 +144,20 @@ class HardwarePWM:
                 f"Exception caught in enabling PWM output: {e}. System set to faulted."
             )
 
-    def stop_pwm(self):
+        if self.config.ramp_config is not None:
+            self._ramp_to(self.config.ramp_config)
+
+    def stop_pwm(self) -> None:
+        """Stop any in-progress ramp, then disable PWM output.
+
+        Safe to call regardless of whether a ramp is configured or
+        currently running: disabling hardware output directly, without
+        stopping the ramp thread first, would leave that thread running
+        (with `current_freq` drifting away from reality) until its
+        `ramp_duration` elapses. This stops the ramp first, so the two
+        stay in sync.
+        """
+        self._stop_sweep()
         try:
             self._pwm.disable()
         except Exception as e:
@@ -131,6 +165,69 @@ class HardwarePWM:
             raise RuntimeError(
                 f"Exception caught in disabling PWM output: {e}. System set to faulted."
             )
+
+    def _ramp_to(self, ramp_config: PWMRampConfig) -> None:
+        # stop any active sweep thread first
+        self._stop_sweep()
+        if self._sweep_thread and self._sweep_thread.is_alive():
+            raise RuntimeError("Previous ramp did not stop in time")
+        self._cancel_event.clear()
+
+        # start up a background thread for stepping loop
+        self._sweep_thread = threading.Thread(
+            target=self._run_ramp,
+            args=(ramp_config,),
+            daemon=True,
+        )
+        self._sweep_thread.start()
+
+    def _run_ramp(self, ramp_config: PWMRampConfig) -> None:
+        initial_hz = self.current_freq
+        target_hz = ramp_config.target_freq_hz
+        duration = ramp_config.ramp_duration_s
+
+        delta_hz = target_hz - initial_hz
+
+        # total number of granular steps to make during ramp duration
+        # (50-100 updates per sec)
+        steps = int(duration * 100)
+        if steps == 0:
+            self.set_frequency(target_hz)
+            return
+
+        time_per_step = duration / steps
+
+        for i in range(1, steps + 1):
+            # check if main thread asked to interrupt this move
+            if self._cancel_event.is_set():
+                break
+
+            # check if PWM hardware reported fault
+            if self._is_faulted:
+                logger.error("Cancelling move - PWM device reported fault")
+                self._cancel_event.set()
+                break
+
+            # linear interpolation to calculate step frequency
+            progress = i / steps
+            next_hz = initial_hz + (delta_hz * progress)
+
+            try:
+                self.set_frequency(next_hz)
+            except Exception as e:
+                logger.error(f"Failed to set step frequency: {e}")
+
+            time.sleep(time_per_step)
+
+    def _stop_sweep(self) -> bool:
+        try:
+            self._cancel_event.set()
+            if self._sweep_thread and self._sweep_thread.is_alive():
+                self._sweep_thread.join(timeout=5)
+        except Exception as e:
+            logger.error(f"Exception caught in stopping PWM ramp: {e}")
+            return False
+        return True
 
     def _clear_fault(self) -> bool:
         self._fault.clear()
@@ -143,107 +240,3 @@ class HardwarePWM:
     @property
     def _is_enabled(self) -> bool:
         return self._pwm.enabled
-
-
-class VariableSpeedPWM:
-    """Drives a `HardwarePWM` through a linear frequency ramp.
-
-    Runs the ramp on a background daemon thread, updating the underlying
-    `HardwarePWM`'s frequency roughly every 10ms (see `_run_ramp`) until
-    `ramp_duration` elapses or the ramp is cancelled. The ramp aborts early
-    if the underlying `HardwarePWM` reports a fault.
-
-    Args:
-        pwm_device: The `HardwarePWM` instance to drive.
-        ramp_config: The target frequency and duration for `ramp_to()`.
-            Copied onto `target_freq`/`ramp_duration`, which can be
-            reassigned directly before calling `ramp_to()` again.
-
-    Attributes:
-        pwm: The `HardwarePWM` being driven.
-        current_freq: The last frequency successfully applied to `pwm`,
-            seeded from `pwm_device.config.frequency_hz` at construction.
-        target_freq: The frequency the next `ramp_to()` call will ramp
-            towards.
-        ramp_duration: How long, in seconds, the next `ramp_to()` call
-            should take.
-    """
-
-    def __init__(self, pwm_device: HardwarePWM, ramp_config: PWMRampConfig):
-        self.pwm = pwm_device
-        self.config = ramp_config
-        self.target_freq = ramp_config.target_freq_hz
-        self.ramp_duration = ramp_config.ramp_duration_s
-
-        self.current_freq: float = pwm_device.config.frequency_hz
-        self._sweep_thread: threading.Thread | None = None
-        self._cancel_event = threading.Event()
-
-    def ramp_to(self):
-        if self.target_freq <= 0:
-            raise ValueError("target_freq must be greater than 0")
-        if self.ramp_duration < 0:
-            raise ValueError("duration_s must be non-negative")
-
-        # stop any active sweep thread first
-        self.stop_sweep()
-        if self._sweep_thread and self._sweep_thread.is_alive():
-            raise RuntimeError("Previous ramp did not stop in time")
-        self._cancel_event.clear()
-
-        # start up a background thread for stepping loop
-        self._sweep_thread = threading.Thread(
-            target=self._run_ramp,
-            daemon=True,
-        )
-        self._sweep_thread.start()
-
-    def _run_ramp(self):
-        initial_hz = self.current_freq
-        target_hz = self.target_freq
-        duration = self.ramp_duration
-
-        delta_hz = target_hz - initial_hz
-
-        # total number of granular steps to make during ramp duration
-        # (50-100 updates per sec)
-        steps = int(duration * 100)
-        if steps == 0:
-            self.pwm.set_frequency(target_hz)
-            self.current_freq = target_hz
-            return
-
-        time_per_step = duration / steps
-
-        for i in range(1, steps + 1):
-            # check if main thread asked to interrupt this move
-            if self._cancel_event.is_set():
-                break
-
-            # check if PWM hardware reported fault
-            if self.pwm._is_faulted:
-                logger.error("Cancelling move - PWM device reported fault")
-                self._cancel_event.set()
-                break
-
-            # linear interpolation to calculate step frequency
-            progress = i / steps
-            next_hz = initial_hz + (delta_hz * progress)
-
-            try:
-                self.pwm.set_frequency(next_hz)
-                self.current_freq = next_hz
-            except Exception as e:
-                logger.error(f"Failed to set step frequency: {e}")
-
-            time.sleep(time_per_step)
-
-    def stop_sweep(self) -> bool:
-        try:
-            self._cancel_event.set()
-            if self._sweep_thread and self._sweep_thread.is_alive():
-                self._sweep_thread.join(timeout=5)
-        except Exception as e:
-            logger.error(f"Exception caught in stopping PWM ramp: {e}")
-            return False
-        return True
