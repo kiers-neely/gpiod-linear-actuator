@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from collections.abc import Iterable
 from types import SimpleNamespace
@@ -6,16 +7,16 @@ from unittest.mock import MagicMock, call, patch
 import gpiod
 from gpiod.line import Direction as LineDirection
 from gpiod.line import Value
-
 from pydantic import ValidationError
 
 from gpiod_stepper_motors.protocol import GPIOValue, InputLabel, OutputLabel
 from gpiod_stepper_motors.pwm import HardwarePWM, PWMConfig, PWMRampConfig
 from gpiod_stepper_motors.stepper import (
     GPIOConfig,
-    GPIODevice,
     GPIOStepperDriver,
     InputLine,
+    LinearActuatorControl,
+    LinearActuatorState,
     OutputLine,
     Pull,
 )
@@ -338,7 +339,7 @@ class GPIODeviceTests(unittest.TestCase):
         ]
 
     def make_device(self, pin_mapping=None):
-        return GPIODevice(
+        return GPIOStepperDriver(
             chip_path="/dev/gpiochip0",
             pin_mapping=(
                 pin_mapping if pin_mapping is not None else self.default_pin_mapping()
@@ -455,7 +456,7 @@ class GPIODeviceEdgeReaderTests(unittest.TestCase):
         self.request.fd = 7
 
     def make_device(self):
-        device = GPIODevice(
+        device = GPIOStepperDriver(
             chip_path="/dev/gpiochip0",
             pin_mapping=[InputLine(label=InputLabel.ALARM, offset=23, pull=Pull.UP)],
         )
@@ -527,11 +528,13 @@ class GPIODeviceEdgeReaderTests(unittest.TestCase):
         with patch("asyncio.get_running_loop", return_value=fake_loop):
             device._start_reader()
 
-        fake_loop.add_reader.assert_called_once_with(self.request.fd, device._monitor_fd)
+        fake_loop.add_reader.assert_called_once_with(
+            self.request.fd, device._monitor_fd
+        )
         self.assertIs(device._loop, fake_loop)
 
     def test_start_reader_raises_if_lines_not_claimed(self):
-        device = GPIODevice(
+        device = GPIOStepperDriver(
             chip_path="/dev/gpiochip0",
             pin_mapping=[InputLine(label=InputLabel.ALARM, offset=23, pull=Pull.UP)],
         )
@@ -584,14 +587,332 @@ class GPIOStepperTests(unittest.TestCase):
     def test_uses_provided_gpio_backend_when_given(self):
         fake_backend = MagicMock()
 
-        stepper = GPIOStepperDriver(self.make_config(), gpio=fake_backend)
+        stepper = LinearActuatorControl(self.make_config(), gpio=fake_backend)
 
         self.assertIs(stepper._gpio, fake_backend)
 
     def test_constructs_gpio_device_when_backend_omitted(self):
-        stepper = GPIOStepperDriver(self.make_config())
+        stepper = LinearActuatorControl(self.make_config())
 
-        self.assertIsInstance(stepper._gpio, GPIODevice)
+        self.assertIsInstance(stepper._gpio, GPIOStepperDriver)
+
+
+class LinearActuatorControlTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.pwm_patcher = patch("gpiod_stepper_motors.pwm.PWM")
+        self.pwm_cls = self.pwm_patcher.start()
+        self.addCleanup(self.pwm_patcher.stop)
+        self.sleep_patcher = patch("gpiod_stepper_motors.pwm.time.sleep")
+        self.sleep_patcher.start()
+        self.addCleanup(self.sleep_patcher.stop)
+
+        self.fake_gpio = MagicMock()
+        self.fake_gpio.is_active.return_value = False
+
+    def make_config(self, **pwm_kwargs):
+        return GPIOConfig(
+            name="x-axis",
+            pin_mapping=[
+                OutputLine(label=OutputLabel.PUL, offset=17),
+                OutputLine(label=OutputLabel.DIR, offset=27),
+                OutputLine(label=OutputLabel.ENA, offset=22),
+                InputLine(label=InputLabel.MAX_LIMIT, offset=23, pull=Pull.UP),
+                InputLine(label=InputLabel.MIN_LIMIT, offset=24, pull=Pull.UP),
+                InputLine(label=InputLabel.ALARM, offset=25, pull=Pull.UP),
+            ],
+            pwm=PWMConfig(label="step", offset=17, **pwm_kwargs),
+        )
+
+    async def make_connected_driver(self, **pwm_kwargs):
+        driver = LinearActuatorControl(self.make_config(**pwm_kwargs), gpio=self.fake_gpio)
+        await driver.connect()
+        return driver
+
+    # -- connect() --
+
+    async def test_connect_registers_callbacks_and_seeds_limits(self):
+        self.fake_gpio.is_active.side_effect = lambda label: label == InputLabel.MIN_LIMIT
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+
+        await driver.connect()
+
+        self.assertTrue(driver.connected)
+        registered_labels = {c.args[0] for c in self.fake_gpio.on_assert.call_args_list}
+        self.assertEqual(
+            registered_labels, {InputLabel.MAX_LIMIT, InputLabel.MIN_LIMIT, InputLabel.ALARM}
+        )
+        self.assertEqual(
+            driver._limit_reached,
+            {InputLabel.MIN_LIMIT: True, InputLabel.MAX_LIMIT: False},
+        )
+        self.assertIsInstance(driver._pwm, HardwarePWM)
+
+    async def test_connect_does_not_start_reader_for_injected_backend(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+
+        await driver.connect()
+
+        self.fake_gpio._start_reader.assert_not_called()
+
+    # -- _on_alarm / _on_limit --
+
+    async def test_on_alarm_sets_flag_and_cancels_current_move(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+        mock_task = MagicMock()
+        driver._current_move = mock_task
+
+        driver._on_alarm()
+
+        self.assertTrue(driver.alarm_active)
+        mock_task.cancel.assert_called_once()
+
+    async def test_on_limit_sets_flag_and_cancels_current_move(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+        mock_task = MagicMock()
+        driver._current_move = mock_task
+
+        driver._on_limit(InputLabel.MAX_LIMIT)()
+
+        self.assertTrue(driver._limit_reached[InputLabel.MAX_LIMIT])
+        mock_task.cancel.assert_called_once()
+
+    # -- enable_drive / disable_drive --
+
+    async def test_enable_drive_succeeds_when_readback_matches(self):
+        driver = await self.make_connected_driver()
+        self.fake_gpio.get.return_value = Value.ACTIVE
+
+        result = driver.enable_drive()
+
+        self.assertTrue(result)
+        self.assertTrue(driver.drive_enabled)
+        self.fake_gpio.set.assert_called_with(OutputLabel.ENA, GPIOValue.ACTIVE)
+
+    async def test_enable_drive_rollback_preserves_prior_state_on_mismatch(self):
+        driver = await self.make_connected_driver()
+        self.fake_gpio.get.side_effect = [Value.ACTIVE, Value.INACTIVE]
+
+        result = driver.enable_drive()
+
+        self.assertFalse(result)
+        self.assertTrue(driver.drive_enabled)  # rolled back to bool(prev) == True
+
+    async def test_disable_drive_succeeds_when_readback_matches(self):
+        driver = await self.make_connected_driver()
+        driver._drive_enabled = True
+        self.fake_gpio.get.return_value = Value.INACTIVE
+
+        result = driver.disable_drive()
+
+        self.assertTrue(result)
+        self.assertFalse(driver.drive_enabled)
+        self.fake_gpio.set.assert_called_with(OutputLabel.ENA, GPIOValue.INACTIVE)
+
+    async def test_disable_drive_rollback_preserves_prior_state_on_mismatch(self):
+        driver = await self.make_connected_driver()
+        driver._drive_enabled = True
+        self.fake_gpio.get.side_effect = [Value.ACTIVE, Value.ACTIVE]
+
+        result = driver.disable_drive()
+
+        self.assertFalse(result)
+        self.assertTrue(driver.drive_enabled)  # rolled back to bool(prev) == True
+
+    # -- start_move() validation --
+
+    async def test_start_move_rejects_invalid_target(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+
+        with self.assertRaises(ValueError):
+            await driver.start_move(LinearActuatorState.MOVING)
+
+    async def test_start_move_requires_connection(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+
+        with self.assertRaises(RuntimeError):
+            await driver.start_move(LinearActuatorState.END)
+
+    async def test_start_move_refuses_while_alarm_active(self):
+        driver = await self.make_connected_driver()
+        driver._alarm_active = True
+
+        with self.assertRaises(RuntimeError):
+            await driver.start_move(LinearActuatorState.END)
+
+    async def test_start_move_refuses_when_already_moving(self):
+        driver = await self.make_connected_driver()
+        stuck_task = MagicMock()
+        stuck_task.done.return_value = False
+        driver._current_move = stuck_task
+
+        with self.assertRaises(RuntimeError):
+            await driver.start_move(LinearActuatorState.END)
+
+    async def test_start_move_returns_immediately_when_already_at_target(self):
+        driver = await self.make_connected_driver()
+        self.fake_gpio.is_active.side_effect = lambda label: label == InputLabel.MAX_LIMIT
+
+        await driver.start_move(LinearActuatorState.END)
+
+        self.pwm_cls.return_value.enable.assert_not_called()
+        self.assertIsNone(driver._current_move)
+
+    # -- start_move() / _run_move() behavior --
+
+    async def test_start_move_stops_cleanly_on_limit_trip(self):
+        driver = await self.make_connected_driver()
+        driver._drive_enabled = True
+
+        async def trip_soon():
+            await asyncio.sleep(0.01)
+            driver._on_limit(InputLabel.MAX_LIMIT)()
+
+        asyncio.create_task(trip_soon())
+        await driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+
+        self.assertIsNone(driver._current_move)
+        self.assertTrue(driver._limit_reached[InputLabel.MAX_LIMIT])
+        self.fake_gpio.set.assert_any_call(OutputLabel.DIR, GPIOValue.ACTIVE)
+        self.pwm_cls.return_value.disable.assert_called_once()
+
+    async def test_start_move_stops_cleanly_on_alarm(self):
+        driver = await self.make_connected_driver()
+        driver._drive_enabled = True
+
+        async def trip_soon():
+            await asyncio.sleep(0.01)
+            driver._on_alarm()
+
+        asyncio.create_task(trip_soon())
+        await driver.start_move(LinearActuatorState.HOME, max_duration_s=5.0)
+
+        self.assertIsNone(driver._current_move)
+        self.assertTrue(driver.alarm_active)
+        self.fake_gpio.set.assert_any_call(OutputLabel.DIR, GPIOValue.INACTIVE)
+        self.pwm_cls.return_value.disable.assert_called_once()
+
+    async def test_start_move_raises_timeout_error_when_nothing_trips(self):
+        driver = await self.make_connected_driver()
+        driver._drive_enabled = True
+
+        with self.assertRaises(TimeoutError):
+            await driver.start_move(LinearActuatorState.END, max_duration_s=0.02)
+
+        self.assertIsNone(driver._current_move)
+        self.pwm_cls.return_value.disable.assert_called_once()
+
+    async def test_start_move_enables_drive_and_settles_when_not_enabled(self):
+        driver = await self.make_connected_driver()
+        self.fake_gpio.get.return_value = Value.ACTIVE
+
+        async def trip_soon():
+            await asyncio.sleep(0.15)
+            driver._on_limit(InputLabel.MAX_LIMIT)()
+
+        asyncio.create_task(trip_soon())
+        await driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+
+        self.assertTrue(driver.drive_enabled)
+        self.fake_gpio.set.assert_any_call(OutputLabel.ENA, GPIOValue.ACTIVE)
+
+    async def test_start_move_skips_enable_when_drive_already_enabled(self):
+        driver = await self.make_connected_driver()
+        driver._drive_enabled = True
+        self.fake_gpio.reset_mock()
+
+        async def trip_soon():
+            await asyncio.sleep(0.01)
+            driver._on_limit(InputLabel.MAX_LIMIT)()
+
+        asyncio.create_task(trip_soon())
+        await driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+
+        ena_calls = [
+            c for c in self.fake_gpio.set.call_args_list if c.args[0] == OutputLabel.ENA
+        ]
+        self.assertEqual(ena_calls, [])
+
+    async def test_start_move_can_be_stopped_by_user_via_stop_move(self):
+        driver = await self.make_connected_driver()
+        driver._drive_enabled = True
+
+        move_task = asyncio.create_task(
+            driver.start_move(LinearActuatorState.END, max_duration_s=5.0)
+        )
+        await asyncio.sleep(0.01)
+
+        stopped = await driver.stop_move()
+        await move_task
+
+        self.assertTrue(stopped)
+        self.assertIsNone(driver._current_move)
+        self.assertFalse(driver._limit_reached.get(InputLabel.MAX_LIMIT, False))
+
+    # -- stop_move() --
+
+    async def test_stop_move_with_no_active_move_still_stops_pwm(self):
+        driver = await self.make_connected_driver()
+
+        result = await driver.stop_move()
+
+        self.assertTrue(result)
+        self.pwm_cls.return_value.disable.assert_called_once()
+
+    async def test_stop_move_returns_false_when_pwm_raises(self):
+        driver = await self.make_connected_driver()
+        self.pwm_cls.return_value.disable.side_effect = RuntimeError("boom")
+
+        result = await driver.stop_move()
+
+        self.assertFalse(result)
+
+    # -- refresh_limits() --
+
+    async def test_refresh_limits_updates_both_limits_from_gpio(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+        self.fake_gpio.is_active.side_effect = lambda label: label == InputLabel.MIN_LIMIT
+
+        result = await driver.refresh_limits()
+
+        self.assertEqual(
+            result, {InputLabel.MIN_LIMIT: True, InputLabel.MAX_LIMIT: False}
+        )
+
+    # -- clear_alarm() --
+
+    async def test_clear_alarm_refuses_while_line_active(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+        driver._alarm_active = True
+        self.fake_gpio.is_active.return_value = True
+
+        self.assertFalse(driver.clear_alarm())
+        self.assertTrue(driver.alarm_active)
+
+    async def test_clear_alarm_succeeds_once_line_inactive(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+        driver._alarm_active = True
+        self.fake_gpio.is_active.return_value = False
+
+        self.assertTrue(driver.clear_alarm())
+        self.assertFalse(driver.alarm_active)
+
+    # -- teardown() --
+
+    async def test_teardown_stops_move_and_closes_everything(self):
+        driver = await self.make_connected_driver()
+
+        await driver.teardown()
+
+        self.pwm_cls.return_value.disable.assert_called_once()
+        self.pwm_cls.return_value.close.assert_called_once()
+        self.fake_gpio.close.assert_called_once()
+
+    async def test_teardown_safe_when_never_connected(self):
+        driver = LinearActuatorControl(self.make_config(), gpio=self.fake_gpio)
+
+        await driver.teardown()  # must not raise
+
+        self.fake_gpio.close.assert_called_once()
 
 
 if __name__ == "__main__":

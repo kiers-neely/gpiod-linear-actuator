@@ -111,13 +111,13 @@ def main() -> None:
             (args.peak, args.cruise_duration),
             (end_hz, args.decel_duration),
         ]
-        title = (
-            f"HardwarePWM accel/decel: {args.start} -> {args.peak} -> {end_hz} Hz"
-        )
+        title = f"HardwarePWM accel/decel: {args.start} -> {args.peak} -> {end_hz} Hz"
     else:
         target_hz = 1000.0 if args.target is None else args.target
         segments = [(target_hz, args.duration)]
-        title = f"HardwarePWM ramp: {args.start} Hz -> {target_hz} Hz over {args.duration}s"
+        title = (
+            f"HardwarePWM ramp: {args.start} Hz -> {target_hz} Hz over {args.duration}s"
+        )
 
     samples = record_ramp(args.start, segments)
     times, freqs = zip(*samples)

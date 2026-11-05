@@ -3,7 +3,13 @@ import time
 
 from loguru import logger
 from periphery import PWM, PWMError
-from pydantic import BaseModel, NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import (
+    BaseModel,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+)
 
 
 class PWMRampConfig(BaseModel):
