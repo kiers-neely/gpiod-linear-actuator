@@ -2,8 +2,9 @@
 
 {% macro is_public(doc) %}
     {#
-    Same as pdoc's default is_public, minus the underscore-prefix check, so
-    that documented private members (_foo) show up alongside public ones.
+    Same as pdoc's default is_public, minus the single-underscore-prefix
+    check, so that documented private methods (_foo) show up alongside
+    public ones. Dunder members (__foo__) stay hidden, except __init__.
     #}
     {% if "@private" in doc.docstring %}
         {# hide members explicitly marked as @private #}
@@ -12,8 +13,11 @@
         true
     {% elif not include_undocumented and not doc.docstring and doc.kind != "module" %}
         {# hide members that are undocumented if include_undocumented has been toggled off. #}
-    {% elif doc.name == "__doc__" %}
-        {# We don't want to document __doc__ itself, https://github.com/mitmproxy/pdoc/issues/235 #}
+    {% elif doc.name == "__init__" and (doc.docstring or (doc.kind == "function" and doc.signature_without_self.parameters)) %}
+        {# show constructors that have a docstring or at least one extra argument #}
+        true
+    {% elif doc.name.startswith("__") and doc.name.endswith("__") %}
+        {# hide dunder attributes/methods other than __init__, handled above #}
     {% elif doc.kind == "variable" and doc.is_typevar and not doc.docstring %}
         {# do not document TypeVars, that only clutters the docs. #}
     {% elif doc.kind == "module" and doc.fullname not in all_modules %}
