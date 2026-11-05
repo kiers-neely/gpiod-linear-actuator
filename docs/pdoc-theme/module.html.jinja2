@@ -1,10 +1,30 @@
 {% extends "default/module.html.jinja2" %}
 
+{% macro has_own_init(doc) %}
+    {#
+    True if the class containing `doc` declares its own __init__ (rather than
+    inheriting one), used to tell "functional"/stateful classes apart from
+    data-only ones (Enums, pydantic BaseModels) that have no custom __init__.
+    #}
+    {% if "." in doc.qualname %}
+        {% set parent = module.get(doc.qualname.rsplit(".", 1)[0]) %}
+        {% if parent %}
+            {% for om in parent.own_members %}
+                {% if om.name == "__init__" %}true{% endif %}
+            {% endfor %}
+        {% endif %}
+    {% endif %}
+{% endmacro %}
+
 {% macro is_public(doc) %}
     {#
-    Same as pdoc's default is_public, minus the single-underscore-prefix
-    check, so that documented private methods (_foo) show up alongside
-    public ones. Dunder members (__foo__) stay hidden, except __init__.
+    Same as pdoc's default is_public, but additionally shows documented
+    single-underscore private methods/attributes (_foo) on classes that
+    declare their own __init__ -- the "functional"/stateful classes like
+    HardwarePWM, GPIOStepperDriver, LinearActuatorControl. Enums and
+    pydantic BaseModel classes have no custom __init__, so their internal
+    _sunder_/_name_/_value_ clutter stays hidden, same as pdoc's default.
+    Dunder members (__foo__) stay hidden regardless, except __init__ itself.
     #}
     {% if "@private" in doc.docstring %}
         {# hide members explicitly marked as @private #}
@@ -22,7 +42,14 @@
         {# do not document TypeVars, that only clutters the docs. #}
     {% elif doc.kind == "module" and doc.fullname not in all_modules %}
         {# Skip modules that were manually excluded, https://github.com/mitmproxy/pdoc/issues/334 #}
-    {% else %}
+    {% elif (doc.qualname or doc.name) is in(module.obj.__all__ or []) %}
+        {# members starting with an underscore are still public if mentioned in __all__ #}
+        true
+    {% elif doc.name.startswith("_") and has_own_init(doc) | trim %}
+        {# documented private method/attribute on a stateful/functional class #}
+        true
+    {% elif not doc.name.startswith("_") %}
+        {# members not starting with an underscore are considered public by default #}
         true
     {% endif %}
 {% endmacro %}
