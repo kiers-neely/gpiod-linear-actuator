@@ -1,0 +1,15 @@
+{#
+Same auto-redirect as pdoc's default index.html.jinja2, but with social-meta.html.jinja2
+included in <head>. Crawlers for link previews (Slack, Twitter, etc.) read the static HTML
+and don't execute the meta-refresh, so the default redirect-only page never exposed the
+Open Graph / Twitter Card tags set up in frame.html.jinja2. This only documents the
+single-root-module case (root_module_name set), which is all this project ever has.
+#}
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="refresh" content="0; url=./{{ root_module_name.replace(".","/") }}.html"/>
+    {% include "social-meta.html.jinja2" %}
+</head>
+</html>

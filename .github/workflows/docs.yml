@@ -22,6 +22,7 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - run: uv sync --group dev
       - run: uv run pdoc -o site -d markdown -t docs/pdoc-theme src/gpiod_stepper_motors/*.py
+      - run: cp docs/assets/social-preview.png site/social-preview.png
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
