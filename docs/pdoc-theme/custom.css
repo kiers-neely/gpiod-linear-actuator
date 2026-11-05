@@ -1,0 +1,66 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&display=swap');
+
+:root {
+    --pdoc-background: #282c34;
+}
+
+.pdoc {
+    --text: #abb2bf;
+    --muted: #7f848e;
+    --link: #61afef;
+    --link-hover: #82c3ff;
+    --code: #21252b;
+    --active: rgba(229, 192, 123, 0.25);
+
+    --accent: #21252b;
+    --accent2: #4b5263;
+
+    --nav-hover: rgba(255, 255, 255, 0.08);
+    --name: #61afef;
+    --def: #c678dd;
+    --annotation: #98c379;
+}
+
+body {
+    color: var(--text);
+}
+
+body,
+.pdoc,
+.pdoc input,
+.pdoc button,
+.pdoc select {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* dark-friendly admonitions, overriding content.css's light alert colors */
+.pdoc .alert.note {
+    color: #cfe2ff;
+    background-color: #10243e;
+    border-color: #1b3a5c;
+}
+
+.pdoc .alert.tip {
+    color: #d1e7dd;
+    background-color: #0f2a1d;
+    border-color: #1d4631;
+}
+
+.pdoc .alert.important {
+    color: #cff4fc;
+    background-color: #0d2b30;
+    border-color: #184850;
+}
+
+.pdoc .alert.warning {
+    color: #fff3cd;
+    background-color: #332701;
+    border-color: #594102;
+}
+
+.pdoc .alert.caution,
+.pdoc .alert.danger {
+    color: #f8d7da;
+    background-color: #3a1419;
+    border-color: #5c2029;
+}

@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync --group dev
-      - run: uv run pdoc -o site -d markdown src/gpiod_stepper_motors/*.py
+      - run: uv run pdoc -o site -d markdown -t docs/pdoc-theme src/gpiod_stepper_motors/*.py
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
