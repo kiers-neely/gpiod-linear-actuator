@@ -22,11 +22,13 @@ uv sync
   rather than jumping straight to a target speed.
 - **`GPIODevice`** — claims a declarative pin mapping (STEP/DIR/ENA outputs,
   ALARM/limit-switch inputs) as a single `gpiod` line request, and exposes
-  `open`/`close`/`get`/`set`/`is_active`. Edge-event callbacks (`on_assert`)
-  are planned but not implemented yet.
-- **`GPIOStepper`** — ties a `GPIOConfig` (pin mapping + PWM + ramp settings)
-  together with a `GPIODevice`. Still a thin shell; stepping logic isn't
-  implemented yet.
+  `open`/`close`/`get`/`set`/`is_active`. Input lines can also raise a
+  synchronous callback when they become active via `on_assert`, dispatched
+  through `asyncio`'s `loop.add_reader` with no polling or background
+  thread.
+- **`GPIOStepperDriver`** — ties a `GPIOConfig` (pin mapping + PWM + ramp
+  settings) together with a `GPIODevice`. Still a thin shell; stepping
+  logic isn't implemented yet.
 - **`load_gpio_config`/`load_pwm_config`/`load_pwm_ramp_config`** — load any
   of this library's pydantic config models from a YAML file.
 
@@ -62,6 +64,12 @@ if device.is_active(InputLabel.ALARM):
     print("ALARM line is asserted")
 
 raw_value = device.get(InputLabel.MAX_LIMIT)
+
+# on_assert() registers a callback for when an input line becomes active
+device.on_assert(InputLabel.ALARM, lambda: print("ALARM asserted!"))
+# from inside a running asyncio event loop, start dispatching those
+# callbacks via loop.add_reader (no polling, no background thread):
+# device._start_reader()
 
 device.close()  # safe to call even if open() was never called, or called twice
 ```

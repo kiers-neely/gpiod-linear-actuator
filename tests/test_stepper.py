@@ -1,5 +1,6 @@
 import unittest
 from collections.abc import Iterable
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import gpiod
@@ -16,7 +17,7 @@ from gpiod_stepper_motors.pwm import (
 from gpiod_stepper_motors.stepper import (
     GPIOConfig,
     GPIODevice,
-    GPIOStepper,
+    GPIOStepperDriver,
     InputLine,
     OutputLine,
     Pull,
@@ -24,10 +25,11 @@ from gpiod_stepper_motors.stepper import (
 
 
 class StepperMotorTests(unittest.TestCase):
-    """Mocks a GPIO chip/channel at the gpiod layer for future GPIOStepper tests.
+    """Exercises a mock GPIO chip/channel at the raw gpiod layer.
 
-    No stepper motor class exists yet (StepperMotor was removed, GPIOStepper is
-    still a stub), so these only exercise the request_lines double itself.
+    Predates `GPIODevice` (see `GPIODeviceTests` below for that); kept as a
+    minimal sanity check of the `gpiod.request_lines` mocking pattern used
+    throughout this file.
     """
 
     STEP_PIN = 17
@@ -426,6 +428,130 @@ class GPIODeviceTests(unittest.TestCase):
         self.request.release.assert_called_once()
 
 
+class GPIODeviceEdgeReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.chip_patcher = patch("gpiod_stepper_motors.stepper.Chip")
+        self.chip_cls = self.chip_patcher.start()
+        self.addCleanup(self.chip_patcher.stop)
+        self.chip = self.chip_cls.return_value.__enter__.return_value
+        self.request = self.chip.request_lines.return_value
+        self.request.chip_name = "gpiochip0"
+        self.request.fd = 7
+
+    def make_device(self):
+        device = GPIODevice(
+            chip_path="/dev/gpiochip0",
+            pin_mapping=[InputLine(label=InputLabel.ALARM, offset=23, pull=Pull.UP)],
+        )
+        device.open()
+        return device
+
+    def make_event(self, offset):
+        return SimpleNamespace(line_offset=offset)
+
+    def test_on_assert_registers_callback_by_label(self):
+        device = self.make_device()
+        callback = MagicMock()
+
+        device.on_assert(InputLabel.ALARM, callback)
+
+        self.assertIs(device._callbacks_by_offset[23], callback)
+
+    def test_on_assert_registers_callback_by_offset(self):
+        device = self.make_device()
+        callback = MagicMock()
+
+        device.on_assert(23, callback)
+
+        self.assertIs(device._callbacks_by_offset[23], callback)
+
+    def test_on_assert_unknown_label_raises_key_error(self):
+        device = self.make_device()
+
+        with self.assertRaises(KeyError):
+            device.on_assert(InputLabel.MAX_LIMIT, MagicMock())
+
+    def test_handle_edge_event_invokes_matching_callback(self):
+        device = self.make_device()
+        callback = MagicMock()
+        device.on_assert(InputLabel.ALARM, callback)
+
+        device._handle_edge_event(self.make_event(23))
+
+        callback.assert_called_once()
+
+    def test_handle_edge_event_noop_when_no_callback_registered(self):
+        device = self.make_device()
+
+        device._handle_edge_event(self.make_event(23))  # must not raise
+
+    def test_handle_edge_event_logs_and_continues_when_callback_raises(self):
+        device = self.make_device()
+        device.on_assert(InputLabel.ALARM, MagicMock(side_effect=RuntimeError("boom")))
+
+        device._handle_edge_event(self.make_event(23))  # must not raise
+
+    def test_monitor_fd_dispatches_all_pending_events(self):
+        device = self.make_device()
+        callback = MagicMock()
+        device.on_assert(InputLabel.ALARM, callback)
+        self.request.read_edge_events.return_value = [
+            self.make_event(23),
+            self.make_event(23),
+        ]
+
+        device._monitor_fd()
+
+        self.assertEqual(callback.call_count, 2)
+
+    def test_start_reader_registers_monitor_fd_with_running_loop(self):
+        device = self.make_device()
+        fake_loop = MagicMock()
+
+        with patch("asyncio.get_running_loop", return_value=fake_loop):
+            device._start_reader()
+
+        fake_loop.add_reader.assert_called_once_with(self.request.fd, device._monitor_fd)
+        self.assertIs(device._loop, fake_loop)
+
+    def test_start_reader_raises_if_lines_not_claimed(self):
+        device = GPIODevice(
+            chip_path="/dev/gpiochip0",
+            pin_mapping=[InputLine(label=InputLabel.ALARM, offset=23, pull=Pull.UP)],
+        )
+
+        with self.assertRaises(RuntimeError):
+            device._start_reader()
+
+    def test_stop_reader_removes_registered_fd(self):
+        device = self.make_device()
+        fake_loop = MagicMock()
+        with patch("asyncio.get_running_loop", return_value=fake_loop):
+            device._start_reader()
+
+        device._stop_reader()
+
+        fake_loop.remove_reader.assert_called_once_with(self.request.fd)
+        self.assertIsNone(device._loop)
+
+    def test_stop_reader_is_safe_without_starting(self):
+        device = self.make_device()
+
+        device._stop_reader()  # must not raise
+
+    def test_close_releases_lines_even_if_stop_reader_fails(self):
+        device = self.make_device()
+        fake_loop = MagicMock()
+        fake_loop.remove_reader.side_effect = RuntimeError("boom")
+        with patch("asyncio.get_running_loop", return_value=fake_loop):
+            device._start_reader()
+
+        device.close()
+
+        self.request.release.assert_called_once()
+        self.assertIsNone(device.line_request)
+
+
 class GPIOStepperTests(unittest.TestCase):
     def make_config(self):
         return GPIOConfig(
@@ -437,12 +563,12 @@ class GPIOStepperTests(unittest.TestCase):
     def test_uses_provided_gpio_backend_when_given(self):
         fake_backend = MagicMock()
 
-        stepper = GPIOStepper(self.make_config(), gpio=fake_backend)
+        stepper = GPIOStepperDriver(self.make_config(), gpio=fake_backend)
 
         self.assertIs(stepper._gpio, fake_backend)
 
     def test_constructs_gpio_device_when_backend_omitted(self):
-        stepper = GPIOStepper(self.make_config())
+        stepper = GPIOStepperDriver(self.make_config())
 
         self.assertIsInstance(stepper._gpio, GPIODevice)
 

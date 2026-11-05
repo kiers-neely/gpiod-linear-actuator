@@ -5,10 +5,10 @@ from .config import (
     load_yaml_config,
 )
 from .pwm import HardwarePWM, VariableSpeedPWM
-from .stepper import GPIOStepper
+from .stepper import GPIOStepperDriver
 
 __all__ = [
-    "GPIOStepper",
+    "GPIOStepperDriver",
     "HardwarePWM",
     "VariableSpeedPWM",
     "load_gpio_config",

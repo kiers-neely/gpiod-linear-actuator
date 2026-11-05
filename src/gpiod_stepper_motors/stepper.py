@@ -1,6 +1,9 @@
+import asyncio
+from collections.abc import Callable
 from enum import StrEnum
 
 from gpiod.chip import Chip
+from gpiod.edge_event import EdgeEvent
 from gpiod.line import Bias as LineBias
 from gpiod.line import Direction as LineDirection
 from gpiod.line import Edge as LineEdge
@@ -73,9 +76,13 @@ class InputLine(BaseModel):
         return self.pull == Pull.UP and not self.normally_closed
 
     @property
-    def edge_from_active_logic(self) -> LineEdge:
+    def active_edge(self) -> LineEdge:
         """
-        Edge detection for this line, based on active low polarity.
+        The `gpiod` edge-detection setting for this line becoming active.
+
+        Used to configure `LineSettings.edge_detection` so the kernel only
+        reports the inactive-to-active transition; every edge event read
+        for this line is therefore an assertion by construction.
 
         Returns:
             LineEdge: FALLING if `active_low` is set to True, otherwise
@@ -92,7 +99,7 @@ class GPIOConfig(BaseModel):
 
     Combines a GPIO pin mapping (STEP/DIR/ENA outputs, ALARM/limit-switch
     inputs) with the PWM channel that drives STEP and an optional velocity
-    ramp profile. Consumed by `GPIOStepper`; `chip_path` and `pin_mapping`
+    ramp profile. Consumed by `GPIOStepperDriver`; `chip_path` and `pin_mapping`
     are also what `GPIODevice` is built from when no backend is injected.
     Can be loaded from YAML via `gpiod_stepper_motors.load_gpio_config`.
 
@@ -129,6 +136,14 @@ class GPIODevice(GPIOBackend):
     `claim_lines`); the resulting `LineRequest` is independent of the chip
     and is what backs every subsequent `get`/`set`/`is_active` call.
 
+    Input lines can also raise a synchronous callback when they become
+    active (a limit switch tripping, an alarm asserting): register one
+    with `on_assert`, then call `_start_reader()` from inside a running
+    asyncio event loop. The reader watches the line request's file
+    descriptor via `loop.add_reader` and dispatches matching callbacks as
+    events arrive, with no polling and no background thread. `close()`
+    always stops the reader before releasing the claimed lines.
+
     Args:
         chip_path: Path to the GPIO character device, e.g. "/dev/gpiochip0".
         pin_mapping: The device's configured lines, a mix of `OutputLine`
@@ -145,6 +160,7 @@ class GPIODevice(GPIOBackend):
         >>> device.set(OutputLabel.PUL, GPIOValue.ACTIVE)
         >>> device.is_active(InputLabel.ALARM)
         False
+        >>> device.on_assert(InputLabel.ALARM, lambda: print("ALARM asserted!"))
         >>> device.close()
     """
 
@@ -154,8 +170,13 @@ class GPIODevice(GPIOBackend):
         pin_mapping: list[InputLine | OutputLine],
     ):
         self._chip_path = chip_path
-        self._offset_by_label = {line.label: line.offset for line in pin_mapping}
 
+        # create line lookup table by str label, for ease of access
+        self._line_by_label = {line.label: line for line in pin_mapping}
+        self._line_by_offset = {line.offset: line for line in pin_mapping}
+
+        # store both input and output lines in one mapping, so all lines can be
+        # claimed in a single request
         self._line_mappings = {
             line.offset: LineSettings(
                 direction=LineDirection.OUTPUT,
@@ -170,15 +191,20 @@ class GPIODevice(GPIOBackend):
             {
                 line.offset: LineSettings(
                     direction=LineDirection.INPUT,
-                    edge_detection=line.edge_from_active_logic,
+                    edge_detection=line.active_edge,
                     bias=_GPIO_BIAS_FROM_PULL[line.pull],
+                    active_low=line.active_low,
                 )
                 for line in pin_mapping
                 if isinstance(line, InputLine)
             }
         )
 
+        # store callbacks in cohesive registry
+        self._callbacks_by_offset: dict[int, Callable[[], None]] = {}
+
         self.line_request = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def claim_lines(self) -> LineRequest:
         """
@@ -210,6 +236,27 @@ class GPIODevice(GPIOBackend):
             self.close()
             raise RuntimeError("Failed to claim GPIO lines") from e
 
+    def close(self):
+        """
+        Shuts down the edge reader and closes the line request, if any.
+
+        Reader must be stopped before releasing claimed lines.
+        """
+        try:
+            self._stop_reader()
+        except Exception as e:
+            logger.error(f"Exception caught in shutting down edge reader: {e}")
+
+        if self.line_request is not None:
+            logger.debug(
+                f"Releasing all lines claimed on {self.line_request.chip_name}"
+            )
+            self.line_request.release()
+        self.line_request = None
+
+    def is_active(self, line: InputLabel | OutputLabel | int) -> bool:
+        return self.get(line) == LineValue.ACTIVE
+
     def get(self, line: InputLabel | OutputLabel | int) -> LineValue:
         """
         Polls whether the line is currently asserted (logically active).
@@ -224,12 +271,14 @@ class GPIODevice(GPIOBackend):
         """
 
         if isinstance(line, InputLabel | OutputLabel):
-            offset = self._offset_by_label.get(line)
-            if offset is None:
-                raise KeyError(f"Offset for label {line} could not be found")
-            return self.line_request.get_value(offset)
+            configured_line = self._line_by_label.get(line)
+            if configured_line is None:
+                raise KeyError(f"No offset found for {line} label")
+            offset = configured_line.offset
         else:
-            return self.line_request.get_value(line)
+            offset = line
+
+        return self.line_request.get_value(offset)
 
     def set(self, line: InputLabel | OutputLabel | int, value: GPIOValue) -> None:
         """
@@ -245,28 +294,97 @@ class GPIODevice(GPIOBackend):
             KeyError: If `line` is a label not found in the configured pin mapping.
         """
         if isinstance(line, InputLabel | OutputLabel):
-            offset = self._offset_by_label.get(line)
-            if offset is None:
-                raise KeyError(f"Offset for label {line} could not be found")
+            configured_line = self._line_by_label.get(line)
+            if configured_line is None:
+                raise KeyError(f"No offset found for {line} label")
+            offset = configured_line.offset
         else:
             offset = line
+
         self.line_request.set_value(offset, _GPIO_VALUE[value])
 
-    def is_active(self, line: InputLabel | OutputLabel | int) -> bool:
-        return self.get(line) == LineValue.ACTIVE
+    def on_assert(self, line: InputLabel | int, callback: Callable[[], None]) -> None:
+        """
+        Store a callback to be called each time a given GPIO line is activated.
 
-    def close(self):
-        """Release the claimed line request, if any. Safe to call twice."""
-        if self.line_request is not None:
-            logger.debug(
-                f"Releasing all lines claimed on {self.line_request.chip_name}"
-            )
-            self.line_request.release()
-            self.line_request = None
+        Args:
+            line (InputLabel | int): The str label or offset of the input line.
+            callback (Callable[[], None]): Called on active edge event.
+
+        Raises:
+            KeyError: If `line` is a label not found in the configured
+            pin mapping.
+        """
+        if isinstance(line, InputLabel):
+            configured_line = self._line_by_label.get(line)
+            if configured_line is None:
+                raise KeyError(f"No offset found for {line} label")
+            offset = configured_line.offset
+        else:
+            offset = line
+        self._callbacks_by_offset[offset] = callback
+
+    def _handle_edge_event(self, event: EdgeEvent) -> None:
+        """Dispatch a single edge event to its registered callback.
+
+        No-ops if no callback for this event is configured.
+        """
+        callback = self._callbacks_by_offset.get(event.line_offset)
+        if callback is not None:
+            try:
+                callback()
+            except Exception as e:
+                logger.error(f"Exception raised in on_assert callback: {e}")
+
+    def _monitor_fd(self) -> None:
+        """
+        Drain all pending edge events and dispatch each one.
+
+        Registered with the event loop by `_start_reader`.
+        """
+        for event in self.line_request.read_edge_events():
+            self._handle_edge_event(event)
+
+    def _start_reader(self) -> None:
+        """
+        Start dispatching `on_assert` callbacks via the running event loop.
+
+        Must be called from inside a running asyncio event loop, after
+        lines have been claimed (see `open`). Registers `_monitor_fd` with
+        `loop.add_reader` on the claimed line request's file descriptor.
+
+        Raises:
+            RuntimeError: If called before lines have been claimed.
+        """
+        if self.line_request is None:
+            raise RuntimeError("Cannot start reader before claiming lines")
+        self._loop = asyncio.get_running_loop()
+        self._loop.add_reader(self.line_request.fd, self._monitor_fd)
+
+    def _stop_reader(self) -> None:
+        """Stop dispatching `on_assert` callbacks.
+
+        Safe to call before `_start_reader()` has ever run, or more than
+        once.
+        """
+        if self._loop is not None and self.line_request is not None:
+            self._loop.remove_reader(self.line_request.fd)
+        self._loop = None
 
 
-class GPIOStepper:
-    """Asynchronous GPIO stepper control class."""
+class GPIOStepperDriver:
+    """Asynchronous GPIO stepper driver control class.
+
+    Ties a `GPIOConfig` (pin mapping, PWM channel, optional ramp) to a
+    `GPIOBackend`. Stepping logic itself isn't implemented yet.
+
+    Args:
+        config: The pin mapping, PWM channel, and optional ramp settings
+            for this motor axis.
+        gpio: The `GPIOBackend` to drive. Defaults to a real `GPIODevice`
+            built from `config.chip_path`/`config.pin_mapping` when
+            omitted; pass one explicitly to inject a test double.
+    """
 
     def __init__(self, config: GPIOConfig, gpio: GPIOBackend | None = None):
         self._config = config

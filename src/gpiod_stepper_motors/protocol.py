@@ -45,4 +45,4 @@ class GPIOBackend(Protocol):
         """Poll the current logical state of one or more GPIO lines."""
 
     def on_assert(self, line: InputLabel | int, callback: Callable[[], None]) -> None:
-        """Call `callback` each time the line asserts."""
+        """Define a `callback` to be called each time an edge event is read."""
